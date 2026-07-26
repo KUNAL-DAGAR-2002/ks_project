@@ -2,11 +2,20 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-test("DailyOps ships product-specific accessible content", async () => {
+test("KiranaSaathi ships product-specific accessible content", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  assert.match(page, /Namaste, Rajesh/);
-  assert.match(page, /Save sale & update stock/);
-  assert.match(page, /Suggested order/);
+  assert.match(page, /Namaste, \$\{currentUser\?\.name\|\|name\}/);
+  assert.match(page, /Daily sales/);
+  assert.match(page, /Stock aur report update ho gaye/);
+  assert.match(page, /Reports/);
+  assert.match(page, /Choose sales image or CSV/);
+  assert.match(page, /Choose bill image or CSV/);
+  assert.match(page, /Choose udhaar image or CSV/);
+  assert.match(page, /Product list/);
+  assert.match(page, /kirana-sales-draft/);
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(css, /focus-visible/);
+  assert.match(css, /min-height:44px/);
   assert.match(page, /Customer udhaar/);
   assert.doesNotMatch(page, /SkeletonPreview|codex-preview/);
 });

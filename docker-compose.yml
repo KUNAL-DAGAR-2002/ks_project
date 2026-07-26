@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: kirana_saathi
+      POSTGRES_USER: kirana
+      POSTGRES_PASSWORD: kirana_dev_only
+    volumes: [kirana_db:/var/lib/postgresql/data]
+  api:
+    build: ./backend
+    ports: ["8000:8000"]
+    environment:
+      KIRANA_DATABASE_URL: postgresql+psycopg://kirana:kirana_dev_only@db:5432/kirana_saathi
+      KIRANA_JWT_SECRET: ${KIRANA_JWT_SECRET:-local-dev-secret-change-me}
+      KIRANA_GROQ_API_KEY: ${KIRANA_GROQ_API_KEY:-}
+    depends_on: [db]
+    volumes: [kirana_uploads:/app/uploads]
+volumes:
+  kirana_db:
+  kirana_uploads:

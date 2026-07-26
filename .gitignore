@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+/.venv/
 /.pnp
 .pnp.*
 .yarn/*
@@ -30,6 +31,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -40,3 +42,12 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+/build/
+/test_artifacts/
+/backend/uploads/
+/backend/backups/
+*.log
+*.db
+__pycache__/
+*.py[cod]
+.pytest_cache/

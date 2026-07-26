@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "DailyOps — Simple shop management",
-  description: "Sales, stock, udhaar and purchase planning for Indian kirana stores.",
+  title: "KiranaSaathi — Roz ka hisaab, sab ek jagah",
+  description: "Daily sales, stock and credit—managed in one simple app.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
