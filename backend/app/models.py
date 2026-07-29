@@ -18,6 +18,8 @@ class User(Base):
     __tablename__ = "users"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     mobile: Mapped[str] = mapped_column(String(15), unique=True, index=True)
+    email: Mapped[str | None] = mapped_column(String(254), unique=True, index=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255))
     name: Mapped[str] = mapped_column(String(120))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -64,6 +66,17 @@ class AuditLog(Base):
     entity: Mapped[str] = mapped_column(String(80))
     record_id: Mapped[str] = mapped_column(String(36))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class AIUsageEvent(Base):
+    __tablename__ = "ai_usage_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    business_id: Mapped[str] = mapped_column(ForeignKey("businesses.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    feature: Mapped[str] = mapped_column(String(60))
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
 
 class Category(Base):
     __tablename__ = "categories"; __table_args__ = (UniqueConstraint("business_id", "name"),)
@@ -126,6 +139,20 @@ class LedgerEntry(Base):
     __tablename__ = "ledger_entries"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); business_id: Mapped[str] = mapped_column(ForeignKey("businesses.id"), index=True); party_type: Mapped[str] = mapped_column(String(20)); party_id: Mapped[str] = mapped_column(String(36), index=True); entry_type: Mapped[str] = mapped_column(String(30)); amount: Mapped[float] = mapped_column(Float); reference_id: Mapped[str | None] = mapped_column(String(36)); due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); created_by: Mapped[str] = mapped_column(ForeignKey("users.id")); created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
+class UdhaarEntry(Base):
+    __tablename__ = "udhaar_entries"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    business_id: Mapped[str] = mapped_column(ForeignKey("businesses.id"), index=True)
+    customer_id: Mapped[str] = mapped_column(ForeignKey("customers.id"), index=True)
+    entry_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    products: Mapped[str] = mapped_column(Text, default="")
+    total_present: Mapped[bool] = mapped_column(Boolean, default=True)
+    amount: Mapped[float] = mapped_column(Float)
+    given: Mapped[float] = mapped_column(Float, default=0)
+    pending: Mapped[float] = mapped_column(Float)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
 class Expense(Base):
     __tablename__ = "expenses"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); business_id: Mapped[str] = mapped_column(ForeignKey("businesses.id"), index=True); store_id: Mapped[str] = mapped_column(ForeignKey("stores.id")); category: Mapped[str] = mapped_column(String(80)); amount: Mapped[float] = mapped_column(Float); payment_method: Mapped[str] = mapped_column(String(20)); payee: Mapped[str | None] = mapped_column(String(120)); created_by: Mapped[str] = mapped_column(ForeignKey("users.id")); created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -140,4 +167,12 @@ class Alert(Base):
 
 class Subscription(Base):
     __tablename__ = "subscriptions"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); business_id: Mapped[str] = mapped_column(ForeignKey("businesses.id"), unique=True); plan: Mapped[str] = mapped_column(String(30), default="trial"); status: Mapped[str] = mapped_column(String(20), default="active"); image_limit: Mapped[int] = mapped_column(Integer, default=10); image_used: Mapped[int] = mapped_column(Integer, default=0)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    business_id: Mapped[str] = mapped_column(ForeignKey("businesses.id"), unique=True)
+    plan: Mapped[str] = mapped_column(String(30), default="starter")
+    status: Mapped[str] = mapped_column(String(20), default="inactive")
+    monthly_price: Mapped[float] = mapped_column(Float, default=599)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    image_limit: Mapped[int] = mapped_column(Integer, default=10)
+    image_used: Mapped[int] = mapped_column(Integer, default=0)

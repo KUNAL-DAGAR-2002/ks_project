@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     otp_dev_code: str = "123456"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+    admin_username: str = "id"
+    admin_password: str = "root"
     upload_dir: str = "./uploads"
     model_config = SettingsConfigDict(env_file=BACKEND_ENV, env_prefix="KIRANA_", extra="ignore")
 

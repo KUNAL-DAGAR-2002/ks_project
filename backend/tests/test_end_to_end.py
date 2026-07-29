@@ -31,7 +31,14 @@ def test_complete_manual_business_flow():
     assert client.post(f"/api/businesses/{bid}/inventory/movements",headers=h,json={"store_id":sid,"product_id":pid,"quantity":20,"unit_cost":90}).status_code==201
     sale=client.post(f"/api/businesses/{bid}/sales",headers=h,json={"store_id":sid,"invoice_number":"S-1","payment_mode":"customer_credit","customer_id":cust["id"],"lines":[{"product_id":pid,"quantity":3,"unit_price":120}]}); assert sale.status_code==201
     daily=client.get(f"/api/businesses/{bid}/sales-daily",headers=h); assert daily.status_code==200 and daily.json()[0]["total_sales"]==360 and daily.json()[0]["transactions"]==1
-    purchase=client.post(f"/api/businesses/{bid}/purchases",headers=h,json={"store_id":sid,"supplier_id":sup["id"],"invoice_number":"P-1","paid":500,"lines":[{"product_id":pid,"quantity":10,"unit_price":92}]}); assert purchase.status_code==201
+    purchase=client.post(f"/api/businesses/{bid}/purchases",headers=h,json={"store_id":sid,"supplier_id":sup["id"],"invoice_number":"P-1","payment_mode":"supplier_credit","paid":0,"lines":[{"product_id":pid,"quantity":10,"unit_price":92}]}); assert purchase.status_code==201
+    supplier_due=client.get(f"/api/businesses/{bid}/supplier-udhaar",headers=h).json()
+    assert len(supplier_due)==1 and supplier_due[0]["udhaar_total"]==920 and supplier_due[0]["amount_pending"]==920
+    paid=client.post(f"/api/businesses/{bid}/supplier-payments",headers=h,json={"supplier_id":sup["id"],"amount_paid":300})
+    assert paid.status_code==201 and paid.json()["amount_pending"]==620
+    supplier_due=client.get(f"/api/businesses/{bid}/supplier-udhaar",headers=h).json()
+    assert supplier_due[0]["amount_paid"]==300 and supplier_due[0]["amount_pending"]==620
+    assert client.post(f"/api/businesses/{bid}/supplier-payments",headers=h,json={"supplier_id":sup["id"],"amount_paid":621}).status_code==422
     assert client.post(f"/api/businesses/{bid}/expenses",headers=h,json={"store_id":sid,"category":"Electricity","amount":250,"payment_method":"cash"}).status_code==201
     inv=client.get(f"/api/businesses/{bid}/inventory",headers=h).json(); assert next(x for x in inv if x["product_id"]==pid)["stock"]==27
     dash=client.get(f"/api/businesses/{bid}/dashboard",headers=h); assert dash.status_code==200; assert dash.json()["net_sales"]==360 and dash.json()["today_sales"]==360 and dash.json()["today_transactions"]==1

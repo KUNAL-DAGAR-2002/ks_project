@@ -6,9 +6,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.orm import Session
 from .config import settings
-from .database import get_db
+from .database import SessionLocal, get_db
 from .gemini_provider import GeminiProvider
-from .models import Alert, AuditLog, BusinessUser, Category, Customer, Expense, ImageDocument, InventoryMovement, LedgerEntry, Product, ProductAlias, ProductUnitMap, Purchase, PurchaseLine, Sale, SaleLine, Store, Subscription, Supplier, User
+from .models import AIUsageEvent, Alert, AuditLog, BusinessUser, Category, Customer, Expense, ImageDocument, InventoryMovement, LedgerEntry, Product, ProductAlias, ProductUnitMap, Purchase, PurchaseLine, Sale, SaleLine, Store, Subscription, Supplier, UdhaarEntry, User
 from .security import current_user
 
 router = APIRouter(prefix="/api")
@@ -18,7 +18,22 @@ def member(db: Session, user: User, business_id: str, roles: set[str] | None=Non
     if not m: raise HTTPException(404,"Business not found")
     if roles and m.role.value not in roles: raise HTTPException(403,"Permission denied")
     return m
+def require_starter(db:Session,business_id:str):
+    subscription=db.scalar(select(Subscription).where(Subscription.business_id==business_id))
+    if not subscription or subscription.status not in {"active","trial"} or not subscription.ends_at:
+        raise HTTPException(403,"An active Starter membership is required")
+    ends=subscription.ends_at
+    if ends.tzinfo is None:ends=ends.replace(tzinfo=timezone.utc)
+    if ends<=now():raise HTTPException(403,"Your Starter membership has expired")
+    return subscription
 def audit(db,bid,user,action,entity,rid): db.add(AuditLog(business_id=bid,user_id=user.id,action=action,entity=entity,record_id=rid))
+def tracked_provider(business_id:str,user_id:str,feature:str)->GeminiProvider:
+    def record(usage:dict):
+        with SessionLocal() as usage_db:
+            usage_db.add(AIUsageEvent(business_id=business_id,user_id=user_id,feature=feature,
+                prompt_tokens=usage["prompt_tokens"],output_tokens=usage["output_tokens"],total_tokens=usage["total_tokens"]))
+            usage_db.commit()
+    return GeminiProvider(usage_recorder=record)
 
 class MasterIn(BaseModel): name:str=Field(min_length=2,max_length=180); mobile:str|None=None
 class ProductIn(BaseModel): store_id:str; code:str; name:str; category_id:str|None=None; supplier_id:str|None=None; local_name:str|None=None; barcode:str|None=None; base_unit:str="piece"; purchase_unit:str="piece"; selling_unit:str="piece"; conversion_factor:float=Field(1,gt=0); mrp:float=Field(0,ge=0); selling_price:float=Field(0,ge=0); purchase_cost:float=Field(0,ge=0); reorder_level:float=Field(0,ge=0); aliases:list[str]=[]
@@ -30,9 +45,24 @@ class LineIn(BaseModel): product_id:str; quantity:float=Field(gt=0); unit_price:
 class SaleIn(BaseModel): store_id:str; invoice_number:str; payment_mode:str; transaction_date:date|None=None; customer_id:str|None=None; discount:float=Field(0,ge=0); lines:list[LineIn]=Field(min_length=1)
 class PurchaseIn(BaseModel): store_id:str; supplier_id:str; invoice_number:str; transaction_date:date|None=None; payment_mode:str="cash"; paid:float=Field(0,ge=0); lines:list[LineIn]=Field(min_length=1)
 class PaymentIn(BaseModel): party_type:str; party_id:str; amount:float=Field(gt=0); entry_type:str="payment"
-class ExpenseIn(BaseModel): store_id:str; category:str; amount:float=Field(gt=0); payment_method:str; payee:str|None=None
+class SupplierPaymentRecordIn(BaseModel): supplier_id:str; amount_paid:float=Field(gt=0); payment_date:date|None=None
+class UdhaarEntryIn(BaseModel):
+    customer_id:str
+    entry_date:date|None=None
+    products:str=Field(default="",max_length=2000)
+    amount:float=Field(ge=0)
+    total_present:bool=True
+    given:float=Field(default=0,ge=0)
+class ExpenseIn(BaseModel): store_id:str; category:str; amount:float=Field(gt=0); payment_method:str; payee:str|None=None; transaction_date:date|None=None
 class NaturalEntryIn(BaseModel): entry_type:str; text:str=Field(min_length=2,max_length=5000)
 class TransactionLineEditIn(BaseModel): quantity:float=Field(gt=0); total_price:float=Field(ge=0); payment_mode:str|None=None; customer_id:str|None=None
+class BusinessChatIn(BaseModel):
+    question:str=Field(min_length=2,max_length=1200)
+    history:list[dict]=Field(default_factory=list,max_length=10)
+    language:str=Field(default="en",pattern=r"^(en|hi|mr|gu|kn|ta)$")
+class ReportInsightIn(BaseModel):
+    period:str=Field(pattern=r"^(week|month|year)$")
+    language:str=Field(default="en",pattern=r"^(en|hi|mr|gu|kn|ta)$")
 class VendorEditIn(BaseModel): name:str=Field(min_length=2,max_length=180); mobile:str|None=None
 class InventoryEditIn(BaseModel): closing_stock:float=Field(ge=0); notes:str|None=None
 
@@ -52,7 +82,7 @@ def entry_datetime(value:date|None)->datetime:
 async def parse_natural_entry(business_id:str,body:NaturalEntryIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id)
     if body.entry_type not in {"sales","stock","products","udhaar"}: raise HTTPException(422,"Unsupported entry type")
-    try: return await GeminiProvider().parse_text(body.text,body.entry_type)
+    try: return await tracked_provider(business_id,user.id,f"parse_{body.entry_type}").parse_text(body.text,body.entry_type)
     except Exception as exc: raise HTTPException(502,f"AI mapping failed: {type(exc).__name__}") from exc
 
 @router.get("/businesses/{business_id}/stores")
@@ -91,10 +121,15 @@ def resolve_customer(business_id:str,body:MasterIn,user:User=Depends(current_use
 @router.get("/businesses/{business_id}/products")
 def products(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)): member(db,user,business_id); return db.scalars(select(Product).where(Product.business_id==business_id,Product.active.is_(True))).all()
 @router.post("/businesses/{business_id}/products",status_code=201)
-def add_product(business_id:str,body:ProductIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
+async def add_product(business_id:str,body:ProductIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id,{"owner","manager"});
     if not db.scalar(select(Store).where(Store.id==body.store_id,Store.business_id==business_id)): raise HTTPException(400,"Invalid store")
-    row=Product(business_id=business_id,store_id=body.store_id,code=body.code,name=body.name,category_id=body.category_id,preferred_supplier_id=body.supplier_id,local_name=body.local_name,barcode=body.barcode,base_unit=body.base_unit,purchase_unit=body.purchase_unit,selling_unit=body.selling_unit,conversion_factor=body.conversion_factor,mrp=body.mrp,selling_price=body.selling_price,purchase_cost=body.purchase_cost,reorder_level=body.reorder_level); db.add(row); db.flush()
+    category_id=body.category_id
+    if category_id:
+        if not db.scalar(select(Category).where(Category.id==category_id,Category.business_id==business_id,Category.active.is_(True))):raise HTTPException(400,"Invalid category")
+    else:
+        category_id=(await resolve_product_category(db,business_id,body.name,user.id)).id
+    row=Product(business_id=business_id,store_id=body.store_id,code=body.code,name=body.name,category_id=category_id,preferred_supplier_id=body.supplier_id,local_name=body.local_name,barcode=body.barcode,base_unit=body.base_unit,purchase_unit=body.purchase_unit,selling_unit=body.selling_unit,conversion_factor=body.conversion_factor,mrp=body.mrp,selling_price=body.selling_price,purchase_cost=body.purchase_cost,reorder_level=body.reorder_level); db.add(row); db.flush()
     db.add_all([ProductAlias(business_id=business_id,product_id=row.id,alias=x) for x in body.aliases]); audit(db,business_id,user,"create","product",row.id); db.commit(); return row
 
 def fallback_unit(label:str, supplied:str|None=None) -> str:
@@ -104,6 +139,45 @@ def fallback_unit(label:str, supplied:str|None=None) -> str:
     if re.search(r"\b\d+(\.\d+)?\s*(kg|g|gram)\b",lower) or any(x in lower for x in ["rice","atta","dal","sugar","salt"]): return "kilogram"
     if any(x in lower for x in ["biscuit","parle","namkeen","noodle","soap","packet","pack"]): return "packet"
     return "piece"
+
+KIRANA_CATEGORIES=[
+    "Staples & Grains","Pulses & Lentils","Dairy","Beverages",
+    "Biscuits & Snacks","Cooking Oil & Ghee","Spices & Condiments",
+    "Instant & Packaged Food","Personal Care","Home Care",
+    "Confectionery","Other",
+]
+
+def fallback_category(label:str)->str:
+    value=label.casefold()
+    rules=[
+        ("Dairy",["milk","dahi","curd","paneer","cheese","butter","cream"]),
+        ("Pulses & Lentils",["dal","daal","pulse","rajma","chana","lentil"]),
+        ("Cooking Oil & Ghee",["oil","ghee","vanaspati"]),
+        ("Biscuits & Snacks",["biscuit","cookie","namkeen","chips","parle","kurkure"]),
+        ("Beverages",["cola","coke","pepsi","juice","drink","tea","coffee","water"]),
+        ("Spices & Condiments",["salt","masala","spice","haldi","mirch","jeera","sauce","pickle"]),
+        ("Instant & Packaged Food",["noodle","maggi","pasta","soup","oats","cornflake"]),
+        ("Personal Care",["shampoo","toothpaste","toothbrush","soap","face wash","hair"]),
+        ("Home Care",["detergent","surf","cleaner","phenyl","dishwash","floor"]),
+        ("Confectionery",["chocolate","candy","toffee","gum"]),
+        ("Staples & Grains",["atta","flour","rice","chawal","sugar","cheeni","wheat","suji","maida"]),
+    ]
+    return next((category for category,terms in rules if any(term in value for term in terms)),"Other")
+
+async def resolve_product_category(db:Session,business_id:str,label:str,user_id:str|None=None)->Category:
+    existing=db.scalars(select(Category).where(Category.business_id==business_id,Category.active.is_(True))).all()
+    existing_by_name={row.name.casefold():row for row in existing}
+    allowed=list(dict.fromkeys([*KIRANA_CATEGORIES,*[row.name for row in existing]]))
+    try:
+        decision=await (tracked_provider(business_id,user_id,"product_category") if user_id else GeminiProvider()).classify_kirana_category(label,allowed)
+        chosen=decision["category"]
+    except Exception:
+        chosen=fallback_category(label)
+    category=existing_by_name.get(chosen.casefold())
+    if category:return category
+    category=Category(business_id=business_id,name=chosen)
+    db.add(category);db.flush()
+    return category
 
 @router.get("/businesses/{business_id}/product-unit-map")
 def product_unit_map(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
@@ -130,7 +204,7 @@ async def match_product(business_id:str,body:MatchProductIn,user:User=Depends(cu
     shortlisted=[p for _,p in sorted(scored,key=lambda x:x[0],reverse=True)[:12]]
     if not shortlisted:raise HTTPException(404,"No products are available. Add the product through Purchases first.")
     try:
-        decision=await GeminiProvider().match_existing_product(entered,[{"id":p.id,"name":p.name,"unit":p.selling_unit,"pack":p.local_name or ""} for p in shortlisted])
+        decision=await tracked_provider(business_id,user.id,"product_match").match_existing_product(entered,[{"id":p.id,"name":p.name,"unit":p.selling_unit,"pack":p.local_name or ""} for p in shortlisted])
     except Exception:
         best_score,best=max(scored,key=lambda x:x[0])
         if best_score>=0.82:return {"product":best,"matched_by":"spelling","confidence":best_score}
@@ -150,7 +224,7 @@ async def resolve_product(business_id:str,body:ResolveProductIn,user:User=Depend
     normalized=re.sub(r"\s+"," ",label.lower()).strip(); knowledge=db.scalar(select(ProductUnitMap).where(ProductUnitMap.normalized_name==normalized))
     if not knowledge:
         try:
-            result=await GeminiProvider().research_indian_kirana_unit(label); unit=result["selling_unit"]; acceptable=result.get("acceptable_units") or [unit]
+            result=await tracked_provider(business_id,user.id,"product_unit_research").research_indian_kirana_unit(label); unit=result["selling_unit"]; acceptable=result.get("acceptable_units") or [unit]
             if "milk" in normalized: acceptable=list(dict.fromkeys([*acceptable,"litre","kilogram"]))
             knowledge=ProductUnitMap(normalized_name=normalized,display_name=label,selling_unit=unit,acceptable_units=acceptable,reasoning=result.get("reasoning"),sources=result.get("sources",[]),lookup_status="researched")
         except Exception as exc:
@@ -160,7 +234,19 @@ async def resolve_product(business_id:str,body:ResolveProductIn,user:User=Depend
         db.add(knowledge); db.flush()
     unit=(body.unit or knowledge.selling_unit).lower()
     code=f"AUTO-{uuid.uuid4().hex[:8].upper()}"; price=body.price or body.mrp
-    product=Product(business_id=business_id,store_id=body.store_id,code=code,name=label,base_unit=unit,purchase_unit=unit,selling_unit=unit,conversion_factor=1,mrp=body.mrp or price,selling_price=price,purchase_cost=0,reorder_level=5); db.add(product); db.flush(); audit(db,business_id,user,"auto_create","product",product.id); db.commit(); return {"product":product,"created":True,"unit_knowledge":{"selling_unit":knowledge.selling_unit,"acceptable_units":knowledge.acceptable_units,"lookup_status":knowledge.lookup_status,"reasoning":knowledge.reasoning}}
+    category=await resolve_product_category(db,business_id,label,user.id)
+    product=Product(business_id=business_id,store_id=body.store_id,code=code,name=label,category_id=category.id,base_unit=unit,purchase_unit=unit,selling_unit=unit,conversion_factor=1,mrp=body.mrp or price,selling_price=price,purchase_cost=0,reorder_level=5); db.add(product); db.flush(); audit(db,business_id,user,"auto_create","product",product.id); db.commit(); return {"product":product,"created":True,"category":{"id":category.id,"name":category.name},"unit_knowledge":{"selling_unit":knowledge.selling_unit,"acceptable_units":knowledge.acceptable_units,"lookup_status":knowledge.lookup_status,"reasoning":knowledge.reasoning}}
+
+@router.post("/businesses/{business_id}/products/backfill-categories")
+async def backfill_product_categories(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    member(db,user,business_id,{"owner","manager"})
+    products=db.scalars(select(Product).where(Product.business_id==business_id,Product.active.is_(True),Product.category_id.is_(None))).all()
+    for product in products:
+        category=await resolve_product_category(db,business_id,product.name,user.id)
+        product.category_id=category.id
+        audit(db,business_id,user,"ai_categorize","product",product.id)
+    db.commit()
+    return {"categorized":len(products)}
 
 @router.patch("/businesses/{business_id}/products/{product_id}")
 def edit_product(business_id:str,product_id:str,body:ProductEditIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
@@ -243,6 +329,74 @@ def payment(business_id:str,body:PaymentIn,user:User=Depends(current_user),db:Se
     allowed={"credit_sale","purchase_credit","opening_balance","payment_received","payment"}
     if body.entry_type not in allowed:raise HTTPException(422,"Choose a valid udhaar entry type.")
     signed=body.amount if body.entry_type in {"credit_sale","purchase_credit","opening_balance"} else -body.amount; row=LedgerEntry(business_id=business_id,party_type=body.party_type,party_id=body.party_id,entry_type=body.entry_type,amount=signed,created_by=user.id); db.add(row); db.flush(); audit(db,business_id,user,"post","ledger_entry",row.id); db.commit(); return row
+
+@router.get("/businesses/{business_id}/supplier-udhaar")
+def supplier_udhaar(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    member(db,user,business_id)
+    credit_rows=db.execute(
+        select(Purchase.supplier_id,func.max(Purchase.created_at).label("last_purchase"),
+               func.sum(Purchase.total).label("udhaar_total"))
+        .where(Purchase.business_id==business_id,Purchase.payment_mode=="supplier_credit")
+        .group_by(Purchase.supplier_id)
+    ).all()
+    paid_rows=dict(db.execute(
+        select(LedgerEntry.party_id,func.coalesce(-func.sum(LedgerEntry.amount),0))
+        .where(LedgerEntry.business_id==business_id,LedgerEntry.party_type=="supplier",
+               LedgerEntry.entry_type=="payment",LedgerEntry.amount<0)
+        .group_by(LedgerEntry.party_id)
+    ).all())
+    suppliers={row.id:row.name for row in db.scalars(select(Supplier).where(Supplier.business_id==business_id))}
+    return [{"supplier_id":row.supplier_id,"date":row.last_purchase,"dealer_name":suppliers.get(row.supplier_id,"Unknown dealer"),
+             "udhaar_total":float(row.udhaar_total or 0),"amount_paid":min(float(row.udhaar_total or 0),float(paid_rows.get(row.supplier_id,0) or 0)),
+             "amount_pending":max(0,float(row.udhaar_total or 0)-float(paid_rows.get(row.supplier_id,0) or 0))}
+            for row in credit_rows]
+
+@router.post("/businesses/{business_id}/supplier-payments",status_code=201)
+def supplier_payment(business_id:str,body:SupplierPaymentRecordIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    member(db,user,business_id,{"owner","manager"})
+    supplier=db.scalar(select(Supplier).where(Supplier.id==body.supplier_id,Supplier.business_id==business_id,Supplier.active.is_(True)))
+    if not supplier:raise HTTPException(400,"Dealer was not found for this business.")
+    total=float(db.scalar(select(func.coalesce(func.sum(Purchase.total),0)).where(
+        Purchase.business_id==business_id,Purchase.supplier_id==supplier.id,Purchase.payment_mode=="supplier_credit")) or 0)
+    paid=float(db.scalar(select(func.coalesce(-func.sum(LedgerEntry.amount),0)).where(
+        LedgerEntry.business_id==business_id,LedgerEntry.party_type=="supplier",LedgerEntry.party_id==supplier.id,
+        LedgerEntry.entry_type=="payment",LedgerEntry.amount<0)) or 0)
+    pending=max(0,total-paid)
+    if body.amount_paid>pending+0.001:raise HTTPException(422,f"Payment cannot exceed the pending amount of ₹{pending:g}.")
+    posted_at=entry_datetime(body.payment_date)
+    row=LedgerEntry(business_id=business_id,party_type="supplier",party_id=supplier.id,entry_type="payment",
+                    amount=-body.amount_paid,created_by=user.id,created_at=posted_at)
+    db.add(row);db.flush();audit(db,business_id,user,"post","supplier_payment",row.id);db.commit()
+    return {"id":row.id,"date":posted_at,"dealer_name":supplier.name,"amount_paid":body.amount_paid,
+            "udhaar_total":total,"amount_pending":pending-body.amount_paid}
+
+@router.post("/businesses/{business_id}/udhaar-entries",status_code=201)
+def add_udhaar_entry(business_id:str,body:UdhaarEntryIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    member(db,user,business_id);require_starter(db,business_id)
+    customer=db.scalar(select(Customer).where(Customer.id==body.customer_id,Customer.business_id==business_id,Customer.active.is_(True)))
+    if not customer:raise HTTPException(400,"Customer was not found for this business.")
+    posted_at=entry_datetime(body.entry_date)
+    ledger_amounts=db.scalars(select(LedgerEntry.amount).where(LedgerEntry.business_id==business_id,LedgerEntry.party_type=="customer",LedgerEntry.party_id==customer.id)).all()
+    previous_total=sum(float(value) for value in ledger_amounts if value>0)
+    previous_paid=-sum(float(value) for value in ledger_amounts if value<0)
+    total=body.amount if body.total_present else previous_total
+    paid=body.given
+    if total+0.001<previous_total:raise HTTPException(422,f"Total Udhaar cannot decrease. Existing total is ₹{previous_total:g}.")
+    if paid+0.001<previous_paid:raise HTTPException(422,f"Total Paid cannot decrease. Existing paid is ₹{previous_paid:g}.")
+    if paid>total+0.001:raise HTTPException(422,"Total Paid cannot be more than Total Udhaar.")
+    row=UdhaarEntry(business_id=business_id,customer_id=customer.id,entry_date=posted_at,products=", ".join(x.strip() for x in body.products.split(",") if x.strip()),total_present=body.total_present,amount=total,given=paid,pending=total-paid,created_by=user.id)
+    db.add(row);db.flush()
+    credit_added=total-previous_total;payment_added=paid-previous_paid
+    if credit_added:db.add(LedgerEntry(business_id=business_id,party_type="customer",party_id=customer.id,entry_type="credit_sale",amount=credit_added,reference_id=row.id,created_by=user.id,created_at=posted_at))
+    if payment_added:db.add(LedgerEntry(business_id=business_id,party_type="customer",party_id=customer.id,entry_type="payment_received",amount=-payment_added,reference_id=row.id,created_by=user.id,created_at=posted_at))
+    audit(db,business_id,user,"post","udhaar_entry",row.id);db.commit()
+    return {"id":row.id,"date":row.entry_date,"customer_name":customer.name,"products":row.products,"amount":row.amount,"given":row.given,"pending":row.pending}
+
+@router.get("/businesses/{business_id}/udhaar-entries")
+def udhaar_entries(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    member(db,user,business_id);require_starter(db,business_id)
+    rows=db.execute(select(UdhaarEntry,Customer).join(Customer,Customer.id==UdhaarEntry.customer_id).where(UdhaarEntry.business_id==business_id).order_by(UdhaarEntry.entry_date.desc(),UdhaarEntry.created_at.desc()).limit(500)).all()
+    return [{"id":row.id,"date":row.entry_date,"customer_id":row.customer_id,"customer_name":customer.name,"products":row.products,"total_present":row.total_present,"amount":row.amount,"given":row.given,"pending":row.pending} for row,customer in rows]
 @router.get("/businesses/{business_id}/ledger")
 def ledger(business_id:str,party_type:str="customer",user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id); rows=db.execute(select(LedgerEntry.party_id,func.sum(LedgerEntry.amount).label("balance"),func.max(LedgerEntry.created_at).label("last_activity")).where(LedgerEntry.business_id==business_id,LedgerEntry.party_type==party_type).group_by(LedgerEntry.party_id)).all(); names={x.id:x.name for x in db.scalars(select(Customer if party_type=="customer" else Supplier).where((Customer if party_type=="customer" else Supplier).business_id==business_id))}; return [{"party_id":r.party_id,"name":names.get(r.party_id,"Unknown"),"balance":r.balance,"last_activity":r.last_activity} for r in rows]
@@ -318,10 +472,12 @@ def purchases_details(business_id:str,user:User=Depends(current_user),db:Session
 def credit_details(business_id:str,party_type:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id)
     if party_type=="customer":
-        credit_day=func.date(LedgerEntry.created_at)
-        rows=db.execute(select(credit_day.label("date"),LedgerEntry.party_id,func.sum(LedgerEntry.amount).label("amount")).where(LedgerEntry.business_id==business_id,LedgerEntry.party_type=="customer",LedgerEntry.entry_type=="credit_sale").group_by(credit_day,LedgerEntry.party_id).order_by(credit_day.desc()).limit(300)).all()
+        rows=db.scalars(select(UdhaarEntry).where(UdhaarEntry.business_id==business_id).order_by(UdhaarEntry.entry_date.desc(),UdhaarEntry.created_at.desc())).all()
         names={x.id:x.name for x in db.scalars(select(Customer).where(Customer.business_id==business_id))}
-        return [{"id":f"{row.date}-{row.party_id}","date":row.date,"party_id":row.party_id,"party_name":names.get(row.party_id,"Unknown customer"),"amount":row.amount} for row in rows]
+        latest={}
+        for row in rows:
+            latest.setdefault(row.customer_id,row)
+        return [{"id":row.id,"date":row.entry_date.date(),"party_id":party_id,"party_name":names.get(party_id,"Unknown customer"),"amount":row.pending} for party_id,row in list(latest.items())[:300]]
     if party_type=="supplier":
         credit_day=func.date(Purchase.created_at)
         rows=db.execute(select(credit_day.label("date"),Supplier.id.label("party_id"),Supplier.name.label("party_name"),func.sum(Purchase.total).label("amount")).join(Supplier,Supplier.id==Purchase.supplier_id).where(Purchase.business_id==business_id,Purchase.payment_mode=="supplier_credit").group_by(credit_day,Supplier.id,Supplier.name).order_by(credit_day.desc()).limit(300)).all()
@@ -377,7 +533,7 @@ def delete_purchase_line(business_id:str,purchase_id:str,line_id:str,user:User=D
 def expense_list(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)): member(db,user,business_id); return db.scalars(select(Expense).where(Expense.business_id==business_id).order_by(Expense.created_at.desc()).limit(100)).all()
 @router.post("/businesses/{business_id}/expenses",status_code=201)
 def expense(business_id:str,body:ExpenseIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    member(db,user,business_id); row=Expense(business_id=business_id,store_id=body.store_id,category=body.category,amount=body.amount,payment_method=body.payment_method,payee=body.payee,created_by=user.id); db.add(row); db.flush(); audit(db,business_id,user,"create","expense",row.id); db.commit(); return row
+    member(db,user,business_id); tenant_store(db,business_id,body.store_id); row=Expense(business_id=business_id,store_id=body.store_id,category=body.category,amount=body.amount,payment_method=body.payment_method,payee=body.payee,created_by=user.id,created_at=entry_datetime(body.transaction_date)); db.add(row); db.flush(); audit(db,business_id,user,"create","expense",row.id); db.commit(); return row
 
 @router.get("/businesses/{business_id}/dashboard")
 def dashboard(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
@@ -387,10 +543,175 @@ def dashboard(business_id:str,user:User=Depends(current_user),db:Session=Depends
 @router.get("/businesses/{business_id}/reorder-list")
 def reorder(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)): return [{**x,"suggested_quantity":max(0,x["reorder_level"]*2-x["stock"])} for x in inventory(business_id,user,db) if x["status"]!="healthy"]
 
+def _analysis_period(db:Session,business_id:str,label:str,start:date,end:date)->dict:
+    start_day,end_day=start.isoformat(),end.isoformat()
+    sale_filter=(Sale.business_id==business_id,func.date(Sale.created_at)>=start_day,func.date(Sale.created_at)<=end_day)
+    purchase_filter=(Purchase.business_id==business_id,func.date(Purchase.created_at)>=start_day,func.date(Purchase.created_at)<=end_day)
+    expense_filter=(Expense.business_id==business_id,func.date(Expense.created_at)>=start_day,func.date(Expense.created_at)<=end_day)
+    sales=float(db.scalar(select(func.coalesce(func.sum(Sale.net),0)).where(*sale_filter)) or 0)
+    purchases=float(db.scalar(select(func.coalesce(func.sum(Purchase.total),0)).where(*purchase_filter)) or 0)
+    expenses=float(db.scalar(select(func.coalesce(func.sum(Expense.amount),0)).where(*expense_filter)) or 0)
+    quantity=float(db.scalar(select(func.coalesce(func.sum(SaleLine.quantity),0)).join(Sale,Sale.id==SaleLine.sale_id).where(*sale_filter)) or 0)
+    profit=float(db.scalar(select(func.coalesce(func.sum(SaleLine.net-SaleLine.quantity*SaleLine.unit_cost),0)).join(Sale,Sale.id==SaleLine.sale_id).where(*sale_filter)) or 0)
+    transactions=int(db.scalar(select(func.count(Sale.id)).where(*sale_filter)) or 0)
+    payment_rows=db.execute(select(Sale.payment_mode,func.coalesce(func.sum(Sale.net),0)).where(*sale_filter).group_by(Sale.payment_mode)).all()
+    days=max(1,(end-start).days+1)
+    return {"label":label,"from":start_day,"to":end_day,"recorded_days":days,"sales":round(sales,2),"quantity_sold":round(quantity,2),"sales_transactions":transactions,"purchases":round(purchases,2),"expenses":round(expenses,2),"gross_profit":round(profit,2),"gross_margin_percent":round(profit/sales*100,1) if sales else 0,"average_daily_sales":round(sales/days,2),"payment_mix":{str(mode):round(float(amount),2) for mode,amount in payment_rows}}
+
+def _business_analysis_context(db:Session,business_id:str,user:User)->dict:
+    today=now().date(); week_start=today-timedelta(days=6); month_start=today.replace(day=1)
+    periods=[
+        _analysis_period(db,business_id,"daily",today,today),
+        _analysis_period(db,business_id,"weekly",week_start,today),
+        _analysis_period(db,business_id,"monthly",month_start,today),
+    ]
+    previous=[
+        _analysis_period(db,business_id,"previous_daily",today-timedelta(days=1),today-timedelta(days=1)),
+        _analysis_period(db,business_id,"previous_weekly",week_start-timedelta(days=7),week_start-timedelta(days=1)),
+    ]
+    top_rows=db.execute(
+        select(Product.name,func.sum(SaleLine.quantity),func.sum(SaleLine.net),func.sum(SaleLine.net-SaleLine.quantity*SaleLine.unit_cost))
+        .join(SaleLine,SaleLine.product_id==Product.id).join(Sale,Sale.id==SaleLine.sale_id)
+        .where(Product.business_id==business_id,Sale.business_id==business_id,func.date(Sale.created_at)>=month_start.isoformat(),func.date(Sale.created_at)<=today.isoformat())
+        .group_by(Product.id,Product.name).order_by(func.sum(SaleLine.net).desc()).limit(10)
+    ).all()
+    stock=inventory(business_id,user,db); low=[{"product":x["name"],"stock":round(float(x["stock"]),2),"unit":x["unit"],"status":x["status"]} for x in stock if x["status"]!="healthy"][:20]
+    customer_balances=ledger(business_id,"customer",user,db)
+    supplier_credit=float(db.scalar(select(func.coalesce(func.sum(Purchase.total),0)).where(Purchase.business_id==business_id,Purchase.payment_mode=="supplier_credit")) or 0)
+    supplier_paid=abs(float(db.scalar(select(func.coalesce(func.sum(LedgerEntry.amount),0)).where(LedgerEntry.business_id==business_id,LedgerEntry.party_type=="supplier",LedgerEntry.entry_type=="payment")) or 0))
+    return {
+        "as_of":today.isoformat(),
+        "periods":periods,
+        "comparison_periods":previous,
+        "top_products_this_month":[{"product":name,"quantity":round(float(qty or 0),2),"sales":round(float(sales or 0),2),"gross_profit":round(float(profit or 0),2)} for name,qty,sales,profit in top_rows],
+        "inventory":{"total_products":len(stock),"low_or_out_of_stock":low},
+        "credit":{"customer_receivable":round(sum(max(0,float(x["balance"])) for x in customer_balances),2),"supplier_payable":round(max(0,supplier_credit-supplier_paid),2)},
+        "data_quality_note":"Figures include only records entered and confirmed in this app.",
+    }
+
+@router.get("/businesses/{business_id}/analysis-summary")
+async def analysis_summary(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    member(db,user,business_id,{"owner","manager"})
+    result=_business_analysis_context(db,business_id,user)
+    tracked_provider(business_id,user.id,"market_context").warm_market_context()
+    return result
+
+@router.post("/businesses/{business_id}/business-chat")
+async def business_chat(business_id:str,body:BusinessChatIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    member(db,user,business_id,{"owner","manager"})
+    context=_business_analysis_context(db,business_id,user)
+    try: result=await tracked_provider(business_id,user.id,"business_chat").business_advice(body.question,context,body.history,body.language)
+    except RuntimeError as exc: raise HTTPException(502,f"Business assistant could not answer: {exc}") from exc
+    audit(db,business_id,user,"ask","business_assistant",str(uuid.uuid4()));db.commit()
+    return {"summary":context,"response":result}
+
+def _report_window(period:str)->tuple[date,date]:
+    end=now().date()
+    if period=="week": return end-timedelta(days=end.weekday()),end
+    if period=="month": return end.replace(day=1),end
+    if period=="year": return end.replace(month=1,day=1),end
+    raise HTTPException(422,"Choose week, month or year.")
+
+def _report_analytics(db:Session,business_id:str,user:User,period:str)->dict:
+    start,end=_report_window(period); start_day,end_day=start.isoformat(),end.isoformat()
+    rows=db.execute(
+        select(Sale.created_at,Product.id,Product.name,Product.base_unit,Category.name,Sale.payment_mode,
+               SaleLine.quantity,SaleLine.net,(SaleLine.net-SaleLine.quantity*SaleLine.unit_cost).label("profit"))
+        .join(SaleLine,SaleLine.sale_id==Sale.id).join(Product,Product.id==SaleLine.product_id)
+        .outerjoin(Category,Category.id==Product.category_id)
+        .where(Sale.business_id==business_id,func.date(Sale.created_at)>=start_day,func.date(Sale.created_at)<=end_day)
+    ).all()
+    daily:dict[str,dict]={}; products:dict[str,dict]={}; categories:dict[str,dict]={}
+    for created,pid,pname,unit,category,payment_mode,qty,net,profit in rows:
+        day=created.date().isoformat(); d=daily.setdefault(day,{"date":day,"sales":0.0,"profit":0.0,"udhaar":0.0,"quantity":0.0})
+        d["sales"]+=float(net);d["profit"]+=float(profit);d["quantity"]+=float(qty)
+        if str(payment_mode).lower()=="customer_credit":d["udhaar"]+=float(net)
+        p=products.setdefault(pid,{"product_id":pid,"name":pname,"unit":unit,"quantity":0.0,"sales":0.0,"profit":0.0})
+        p["quantity"]+=float(qty);p["sales"]+=float(net);p["profit"]+=float(profit)
+        cname=category or "Uncategorised";c=categories.setdefault(cname,{"name":cname,"quantity":0.0,"sales":0.0,"profit":0.0})
+        c["quantity"]+=float(qty);c["sales"]+=float(net);c["profit"]+=float(profit)
+    cursor=start
+    while cursor<=end:
+        key=cursor.isoformat();daily.setdefault(key,{"date":key,"sales":0.0,"profit":0.0,"udhaar":0.0,"quantity":0.0});cursor+=timedelta(days=1)
+    daily_rows=sorted(daily.values(),key=lambda x:x["date"])
+    product_rows=sorted(products.values(),key=lambda x:(-x["quantity"],-x["sales"]))
+    category_rows=sorted(categories.values(),key=lambda x:(-x["quantity"],-x["sales"]))
+    total_sales=sum(x["sales"] for x in daily_rows);total_profit=sum(x["profit"] for x in daily_rows);total_qty=sum(x["quantity"] for x in daily_rows)
+    cumulative=0.0;pareto=[]
+    for product in sorted(product_rows,key=lambda x:-x["sales"]):
+        cumulative+=product["sales"];share=(product["sales"]/total_sales*100) if total_sales else 0
+        pareto.append({**product,"sales_share_percent":round(share,1),"cumulative_percent":round(cumulative/total_sales*100,1) if total_sales else 0,"pareto_core":bool(total_sales and cumulative-product["sales"]<total_sales*.8)})
+    stock=inventory(business_id,user,db);product_velocity={x["product_id"]:x["quantity"]/max(1,(end-start).days+1) for x in product_rows}
+    restock=[]
+    for item in stock:
+        if item["status"]=="healthy":continue
+        velocity=product_velocity.get(item["product_id"],0);suggested=max(0,float(item["reorder_level"])*2-float(item["stock"]),velocity*7-float(item["stock"]))
+        restock.append({"product_id":item["product_id"],"name":item["name"],"status":item["status"],"stock":round(float(item["stock"]),2),"unit":item["unit"],"average_daily_sales":round(velocity,2),"suggested_quantity":round(suggested,2)})
+    restock.sort(key=lambda x:(0 if x["status"]=="out_of_stock" else 1,-x["average_daily_sales"]))
+    weekly:dict[str,dict]={};monthly:dict[str,dict]={}
+    for row in daily_rows:
+        d=date.fromisoformat(row["date"]);monday=d-timedelta(days=d.weekday());wk=weekly.setdefault(monday.isoformat(),{"week_start":monday.isoformat(),"sales":0.0,"profit":0.0,"udhaar":0.0,"quantity":0.0});month=monthly.setdefault(d.strftime("%Y-%m"),{"month":d.strftime("%Y-%m"),"sales":0.0,"profit":0.0,"udhaar":0.0,"quantity":0.0})
+        for target in (wk,month):
+            target["sales"]+=row["sales"];target["profit"]+=row["profit"];target["udhaar"]+=row["udhaar"];target["quantity"]+=row["quantity"]
+    kpis={"total_sales":round(total_sales,2),"profit":round(total_profit,2),"quantity_sold":round(total_qty,2),"gross_margin_percent":round(total_profit/total_sales*100,1) if total_sales else 0,
+          "most_sold_product":product_rows[0] if product_rows else None,"least_sold_product":product_rows[-1] if product_rows else None,
+          "most_sold_category":category_rows[0] if category_rows else None,"least_sold_category":category_rows[-1] if category_rows else None}
+    immediate=[]
+    if restock:immediate.append({"kind":"restock","data":restock[0],"priority":"high","title":f"Restock {restock[0]['name']}","reason":f"{restock[0]['stock']:g} {restock[0]['unit']} left; recent velocity {restock[0]['average_daily_sales']:g}/day.","action":f"Order about {restock[0]['suggested_quantity']:g} {restock[0]['unit']}."})
+    if pareto:
+        core=[x for x in pareto if x["pareto_core"]];immediate.append({"kind":"pareto","data":{"count":len(core)},"priority":"medium","title":"Protect your Pareto products","reason":f"{len(core)} product(s) generate roughly the first 80% of recorded sales.","action":"Keep these products visible and avoid stock-outs."})
+    if product_rows:immediate.append({"kind":"slow_mover","data":product_rows[-1],"priority":"low","title":f"Review slow mover: {product_rows[-1]['name']}","reason":f"Only {product_rows[-1]['quantity']:g} {product_rows[-1]['unit']} sold in this period.","action":"Reduce reorder quantity or test a small promotion."})
+    ai_summary={"period":period,"from":start_day,"to":end_day,"kpis":kpis,"daily_last_14":daily_rows[-14:],"weekly_summaries":list(weekly.values()),"monthly_summaries":list(monthly.values()),"top_products":product_rows[:8],"bottom_products":list(reversed(product_rows[-8:])),"category_rankings":category_rows,"pareto_products":[x for x in pareto if x["pareto_core"]],"restock":restock[:12]}
+    monthly_series=[{"date":f"{row['month']}-01","sales":round(row["sales"],2),"profit":round(row["profit"],2),"udhaar":round(row["udhaar"],2),"quantity":round(row["quantity"],2)} for row in monthly.values()]
+    trend_series=monthly_series if period=="year" else daily_rows
+    return {"period":period,"from":start_day,"to":end_day,"series_granularity":"month" if period=="year" else "day","kpis":kpis,"sales_profit_series":trend_series,"top_products":product_rows[:8],"bottom_products":list(reversed(product_rows[-8:])),"categories":category_rows,"pareto":pareto,"restock":restock,"immediate_insights":immediate,"ai_summary":ai_summary}
+
+@router.get("/businesses/{business_id}/reports/analytics")
+def report_analytics(business_id:str,period:str="week",user:User=Depends(current_user),db:Session=Depends(get_db)):
+    member(db,user,business_id,{"owner","manager"});require_starter(db,business_id)
+    return _report_analytics(db,business_id,user,period)
+
+def _localized_report_fallback(report:dict,language:str)->dict:
+    copy={
+        "en":("Actions from your recorded business data","Live AI formatting was temporarily unavailable, so these actions were calculated directly from your summarized sales, stock and Pareto analysis."),
+        "hi":("आपके दर्ज व्यवसाय डेटा से उपयोगी सुझाव","लाइव AI उत्तर अस्थायी रूप से उपलब्ध नहीं था, इसलिए ये सुझाव आपकी बिक्री, स्टॉक और पैरेटो विश्लेषण के सारांश से सीधे निकाले गए हैं।"),
+        "mr":("तुमच्या नोंदवलेल्या व्यवसाय डेटावर आधारित कृती","लाइव्ह AI उत्तर तात्पुरते उपलब्ध नव्हते, म्हणून या कृती विक्री, साठा आणि पॅरेटो विश्लेषणाच्या सारांशातून थेट मोजल्या आहेत."),
+        "gu":("તમારા નોંધાયેલા વ્યવસાય ડેટા પરથી ઉપયોગી પગલાં","લાઇવ AI જવાબ અસ્થાયી રીતે ઉપલબ્ધ ન હતો, તેથી આ પગલાં વેચાણ, સ્ટોક અને પેરેટો વિશ્લેષણના સારાંશ પરથી સીધા ગણવામાં આવ્યા છે."),
+        "kn":("ನಿಮ್ಮ ದಾಖಲಾದ ವ್ಯಾಪಾರ ಮಾಹಿತಿಯಿಂದ ಉಪಯುಕ್ತ ಕ್ರಮಗಳು","ಲೈವ್ AI ಉತ್ತರ ತಾತ್ಕಾಲಿಕವಾಗಿ ಲಭ್ಯವಿರಲಿಲ್ಲ, ಆದ್ದರಿಂದ ಈ ಕ್ರಮಗಳನ್ನು ಮಾರಾಟ, ದಾಸ್ತಾನು ಮತ್ತು ಪಾರೆಟೊ ವಿಶ್ಲೇಷಣೆಯ ಸಾರಾಂಶದಿಂದ ನೇರವಾಗಿ ಲೆಕ್ಕಿಸಲಾಗಿದೆ."),
+        "ta":("உங்கள் பதிவு செய்யப்பட்ட வணிகத் தரவிலிருந்து பயனுள்ள நடவடிக்கைகள்","நேரடி AI பதில் தற்காலிகமாக கிடைக்கவில்லை; எனவே இந்த நடவடிக்கைகள் விற்பனை, இருப்பு மற்றும் பாரெட்டோ பகுப்பாய்வு சுருக்கத்திலிருந்து நேரடியாக கணக்கிடப்பட்டன."),
+    }
+    actions=[]
+    for item in report["immediate_insights"]:
+        data=item.get("data",{});kind=item.get("kind")
+        if language=="hi":
+            values={"restock":(f"{data.get('name','')} फिर से मंगाएँ",f"{data.get('stock',0):g} {data.get('unit','')} बचा है; हाल की बिक्री गति {data.get('average_daily_sales',0):g} प्रति दिन है।",f"लगभग {data.get('suggested_quantity',0):g} {data.get('unit','')} मंगाएँ।"),"pareto":("अपने पैरेटो उत्पादों का स्टॉक बनाए रखें",f"{data.get('count',0)} उत्पाद दर्ज बिक्री का शुरुआती लगभग 80% बनाते हैं।","इन उत्पादों को आसानी से दिखने वाली जगह रखें और स्टॉक खत्म न होने दें।"),"slow_mover":(f"धीमी बिक्री वाले उत्पाद की समीक्षा करें: {data.get('name','')}",f"इस अवधि में केवल {data.get('quantity',0):g} {data.get('unit','')} बिके।","दोबारा मंगाने की मात्रा घटाएँ या छोटा प्रचार आज़माएँ।")}
+        elif language=="mr":
+            values={"restock":(f"{data.get('name','')} पुन्हा मागवा",f"{data.get('stock',0):g} {data.get('unit','')} शिल्लक; अलीकडील विक्री वेग {data.get('average_daily_sales',0):g} प्रतिदिन आहे.",f"सुमारे {data.get('suggested_quantity',0):g} {data.get('unit','')} मागवा."),"pareto":("तुमच्या पॅरेटो उत्पादनांचा साठा जपा",f"{data.get('count',0)} उत्पादने नोंदवलेल्या विक्रीच्या पहिल्या सुमारे 80% वाटा देतात.","ही उत्पादने सहज दिसतील अशी ठेवा आणि साठा संपू देऊ नका."),"slow_mover":(f"कमी विक्रीच्या उत्पादनाचा आढावा घ्या: {data.get('name','')}",f"या कालावधीत फक्त {data.get('quantity',0):g} {data.get('unit','')} विकले गेले.","पुनर्मागणीचे प्रमाण कमी करा किंवा छोटी जाहिरात करून पाहा.")}
+        elif language=="gu":
+            values={"restock":(f"{data.get('name','')} ફરી મંગાવો",f"{data.get('stock',0):g} {data.get('unit','')} બાકી છે; તાજેતરની વેચાણ ગતિ {data.get('average_daily_sales',0):g} પ્રતિ દિવસ છે.",f"લગભગ {data.get('suggested_quantity',0):g} {data.get('unit','')} મંગાવો."),"pareto":("તમારા પેરેટો ઉત્પાદનોનો સ્ટોક જાળવો",f"{data.get('count',0)} ઉત્પાદનો નોંધાયેલા વેચાણના શરૂઆતના આશરે 80% આપે છે.","આ ઉત્પાદનો સરળતાથી દેખાય તેમ રાખો અને સ્ટોક ખૂટવા ન દો."),"slow_mover":(f"ધીમા વેચાણવાળા ઉત્પાદનની સમીક્ષા કરો: {data.get('name','')}",f"આ સમયગાળામાં માત્ર {data.get('quantity',0):g} {data.get('unit','')} વેચાયા.","ફરી મંગાવવાની માત્રા ઘટાડો અથવા નાનું પ્રમોશન અજમાવો.")}
+        elif language=="kn":
+            values={"restock":(f"{data.get('name','')} ಮತ್ತೆ ತರಿಸಿ",f"{data.get('stock',0):g} {data.get('unit','')} ಉಳಿದಿದೆ; ಇತ್ತೀಚಿನ ಮಾರಾಟ ವೇಗ ದಿನಕ್ಕೆ {data.get('average_daily_sales',0):g}.",f"ಸುಮಾರು {data.get('suggested_quantity',0):g} {data.get('unit','')} ತರಿಸಿ."),"pareto":("ನಿಮ್ಮ ಪಾರೆಟೊ ಉತ್ಪನ್ನಗಳ ದಾಸ್ತಾನು ಕಾಪಾಡಿ",f"{data.get('count',0)} ಉತ್ಪನ್ನಗಳು ದಾಖಲಾದ ಮಾರಾಟದ ಮೊದಲ ಸುಮಾರು 80% ನೀಡುತ್ತವೆ.","ಈ ಉತ್ಪನ್ನಗಳನ್ನು ಸುಲಭವಾಗಿ ಕಾಣುವಂತೆ ಇಡಿ ಮತ್ತು ದಾಸ್ತಾನು ಖಾಲಿಯಾಗದಂತೆ ನೋಡಿಕೊಳ್ಳಿ."),"slow_mover":(f"ನಿಧಾನವಾಗಿ ಮಾರಾಟವಾಗುವ ಉತ್ಪನ್ನ ಪರಿಶೀಲಿಸಿ: {data.get('name','')}",f"ಈ ಅವಧಿಯಲ್ಲಿ ಕೇವಲ {data.get('quantity',0):g} {data.get('unit','')} ಮಾರಾಟವಾಗಿದೆ.","ಮರುಆರ್ಡರ್ ಪ್ರಮಾಣ ಕಡಿಮೆ ಮಾಡಿ ಅಥವಾ ಸಣ್ಣ ಪ್ರಚಾರ ಪ್ರಯತ್ನಿಸಿ.")}
+        elif language=="ta":
+            values={"restock":(f"{data.get('name','')} மீண்டும் வாங்குங்கள்",f"{data.get('stock',0):g} {data.get('unit','')} மீதம்; சமீபத்திய விற்பனை வேகம் நாளுக்கு {data.get('average_daily_sales',0):g}.",f"சுமார் {data.get('suggested_quantity',0):g} {data.get('unit','')} வாங்குங்கள்."),"pareto":("உங்கள் பாரெட்டோ பொருட்களின் இருப்பை பாதுகாக்கவும்",f"{data.get('count',0)} பொருட்கள் பதிவு செய்யப்பட்ட விற்பனையின் முதல் சுமார் 80% வழங்குகின்றன.","இந்த பொருட்களை எளிதாகத் தெரியும்படி வைத்து, இருப்பு தீராமல் கவனிக்கவும்."),"slow_mover":(f"மெதுவாக விற்கும் பொருளை மதிப்பாய்வு செய்யவும்: {data.get('name','')}",f"இந்த காலத்தில் {data.get('quantity',0):g} {data.get('unit','')} மட்டுமே விற்றது.","மறு கொள்முதல் அளவைக் குறைக்கவும் அல்லது சிறிய சலுகையை முயற்சிக்கவும்.")}
+        else: values={}
+        title,reason,next_step=values.get(kind,(item["title"],item["reason"],item["action"]))
+        actions.append({"priority":item["priority"],"title":title,"reason":reason,"next_step":next_step})
+    headline,summary=copy.get(language,copy["en"])
+    return {"headline":headline,"summary":summary,"actions":actions,"risks":[],"opportunities":[],"sources":[]}
+
+@router.post("/businesses/{business_id}/reports/insights")
+async def report_ai_insights(business_id:str,body:ReportInsightIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    member(db,user,business_id,{"owner","manager"});require_starter(db,business_id);report=_report_analytics(db,business_id,user,body.period)
+    try:
+        insights=await tracked_provider(business_id,user.id,"report_insights").report_insights(report["ai_summary"],body.language);source="gemini"
+    except RuntimeError:
+        insights=_localized_report_fallback(report,body.language);source="calculated_fallback"
+    return {"period":body.period,"insights":insights,"source":source}
+
 @router.post("/businesses/{business_id}/images",status_code=202)
 async def upload_image(business_id:str,store_id:str,document_type:str,file:UploadFile=File(...),user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id); tenant_store(db,business_id,store_id)
-    if document_type not in {"sales","purchase","stock","udhaar"}:raise HTTPException(422,"Choose Sales, Purchase, Stock or Udhaar for this image.")
+    if document_type not in {"sales","purchase","stock","udhaar","supplier_payment"}:raise HTTPException(422,"Choose Sales, Purchase, Stock, Udhaar or Supplier Payment for this image.")
     allowed={"image/jpeg","image/png","image/webp"};
     if file.content_type not in allowed: raise HTTPException(415,"Please upload a JPG, PNG or WebP image.")
     content=await file.read();
@@ -403,7 +724,7 @@ async def upload_image(business_id:str,store_id:str,document_type:str,file:Uploa
 async def extract_image(business_id:str,document_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id); row=db.scalar(select(ImageDocument).where(ImageDocument.id==document_id,ImageDocument.business_id==business_id));
     if not row: raise HTTPException(404,"Document not found")
-    try: data=await GeminiProvider().extract(row.storage_path,row.mime_type,row.document_type)
+    try: data=await tracked_provider(business_id,user.id,f"image_{row.document_type}").extract(row.storage_path,row.mime_type,row.document_type)
     except RuntimeError as exc: row.status="failed"; db.commit(); raise HTTPException(502,f"AI extraction failed: {exc}") from exc
     except Exception as exc: row.status="failed"; db.commit(); raise HTTPException(502,"AI extraction failed because Gemini could not be reached. Check your internet connection and try again.") from exc
     row.structured_data=data; row.confidence=float(data.get("confidence",0)); row.status="review_required"; db.commit(); return {"id":row.id,"status":row.status,"data":data}
@@ -436,7 +757,9 @@ async def import_products(business_id:str,store_id:str,file:UploadFile=File(...)
         try: float(r["selling_price"]); float(r["purchase_cost"]); float(r["reorder_level"])
         except ValueError: errors.append({"row":i,"error":"Invalid numeric value"})
     if errors: raise HTTPException(422,{"errors":errors})
-    for r in rows: db.add(Product(business_id=business_id,store_id=store_id,code=r["code"],name=r["name"],base_unit=r["unit"],purchase_unit=r["unit"],selling_unit=r["unit"],selling_price=float(r["selling_price"]),purchase_cost=float(r["purchase_cost"]),reorder_level=float(r["reorder_level"])))
+    for r in rows:
+        category=await resolve_product_category(db,business_id,r["name"],user.id)
+        db.add(Product(business_id=business_id,store_id=store_id,code=r["code"],name=r["name"],category_id=category.id,base_unit=r["unit"],purchase_unit=r["unit"],selling_unit=r["unit"],selling_price=float(r["selling_price"]),purchase_cost=float(r["purchase_cost"]),reorder_level=float(r["reorder_level"])))
     audit(db,business_id,user,"import","products",str(uuid.uuid4())); db.commit(); return {"imported":len(rows),"errors":[]}
 
 @router.get("/businesses/{business_id}/reports/daily-closing.pdf")

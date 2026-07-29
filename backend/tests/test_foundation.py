@@ -1,4 +1,5 @@
 import os
+import uuid
 os.environ["KIRANA_DATABASE_URL"] = "sqlite:///./test_kirana_saathi.db"
 from fastapi.testclient import TestClient
 from app.main import app
@@ -20,6 +21,74 @@ def test_login_name_is_updated_for_returning_user():
     first=auth(mobile,"Old Name")
     second=auth(mobile,"New Name")
     assert client.get("/api/me",headers=second).json()["name"]=="New Name"
+
+def test_explicit_login_and_signup_are_safe():
+    mobile = "9" + str(uuid.uuid4().int)[:9]
+    missing = client.post("/api/auth/otp/verify", json={
+        "mobile": mobile, "code": "123456", "intent": "login"
+    })
+    assert missing.status_code == 404
+    created = client.post("/api/auth/otp/verify", json={
+        "mobile": mobile, "code": "123456", "name": "Signup Owner", "intent": "signup"
+    })
+    assert created.status_code == 200
+    duplicate = client.post("/api/auth/otp/verify", json={
+        "mobile": mobile, "code": "123456", "name": "Wrong Name", "intent": "signup"
+    })
+    assert duplicate.status_code == 409
+    login = client.post("/api/auth/otp/verify", json={
+        "mobile": mobile, "code": "123456", "intent": "login"
+    })
+    assert login.status_code == 200
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    assert client.get("/api/me", headers=headers).json()["name"] == "Signup Owner"
+
+def test_email_password_and_admin_authentication():
+    email=f"owner-{uuid.uuid4().hex[:10]}@example.com"
+    signup=client.post("/api/auth/signup",json={"email":email,"password":"StrongPass123!","name":"Email Owner"})
+    assert signup.status_code==201
+    assert client.post("/api/auth/signup",json={"email":email,"password":"StrongPass123!","name":"Again"}).status_code==409
+    assert client.post("/api/auth/login",json={"email":email,"password":"wrong"}).status_code==401
+    login=client.post("/api/auth/login",json={"email":email.upper(),"password":"StrongPass123!"})
+    assert login.status_code==200
+    me=client.get("/api/me",headers={"Authorization":f"Bearer {login.json()['access_token']}"}).json()
+    assert me["email"]==email and "mobile" not in me
+    assert client.post("/api/admin/login",json={"username":"id","password":"wrong"}).status_code==401
+    admin=client.post("/api/admin/login",json={"username":"id","password":"root"})
+    assert admin.status_code==200
+    overview=client.get("/api/admin/overview",headers={"Authorization":f"Bearer {admin.json()['access_token']}"})
+    assert overview.status_code==200 and "users" in overview.json() and "ai_tokens" in overview.json()["summary"]
+
+def test_admin_can_manage_membership_and_delete_user():
+    email=f"member-{uuid.uuid4().hex[:10]}@example.com"
+    signup=client.post("/api/auth/signup",json={"email":email,"password":"StrongPass123!","name":"Plan Member"})
+    user_headers={"Authorization":f"Bearer {signup.json()['access_token']}"}
+    onboard=client.post("/api/onboarding",headers=user_headers,json={
+        "business_name":"Plan Test Store","store_name":"Main Store","city":"Delhi","state":"Delhi",
+        "pin_code":"110001","preferred_language":"en","working_style":[],"enabled_modules":[]
+    })
+    assert onboard.status_code==201
+    business_id=onboard.json()["id"]
+    initial=client.get(f"/api/businesses/{business_id}/subscription",headers=user_headers)
+    assert initial.status_code==200 and initial.json()["access_active"] is False and initial.json()["can_start_trial"] is True
+    trial=client.post(f"/api/businesses/{business_id}/subscription/trial",headers=user_headers)
+    assert trial.status_code==200 and trial.json()["status"]=="trial" and trial.json()["days_remaining"]==7
+    assert client.post(f"/api/businesses/{business_id}/subscription/trial",headers=user_headers).status_code==409
+    admin=client.post("/api/admin/login",json={"username":"id","password":"root"}).json()
+    admin_headers={"Authorization":f"Bearer {admin['access_token']}"}
+    overview=client.get("/api/admin/overview",headers=admin_headers).json()
+    user=next(row for row in overview["users"] if row["email"]==email)
+    granted=client.post(f"/api/admin/users/{user['id']}/subscription",headers=admin_headers)
+    assert granted.status_code==200
+    refreshed=client.get("/api/admin/overview",headers=admin_headers).json()
+    subscription=next(row for row in refreshed["users"] if row["id"]==user["id"])["businesses"][0]["subscription"]
+    assert subscription["plan"]=="starter" and subscription["status"]=="active" and subscription["monthly_price"]==599
+    assert subscription["access_active"] is True and subscription["days_remaining"]>=30
+    assert client.delete(f"/api/admin/users/{user['id']}/subscription",headers=admin_headers).status_code==200
+    revoked=client.get(f"/api/businesses/{business_id}/subscription",headers=user_headers).json()
+    assert revoked["status"]=="ended" and revoked["access_active"] is False and revoked["can_start_trial"] is False
+    assert client.delete(f"/api/admin/users/{user['id']}",headers=admin_headers).status_code==200
+    assert client.post("/api/auth/login",json={"email":email,"password":"StrongPass123!"}).status_code==401
 
 def test_onboarding_and_tenant_isolation():
     owner_a, owner_b = auth("9876543211"), auth("9876543212")
