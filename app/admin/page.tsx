@@ -7,10 +7,10 @@ const number=(value:unknown)=>Number(value||0).toLocaleString("en-IN");
 const date=(value:string|null)=>value?new Date(value).toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"}):"—";
 
 export default function AdminConsole(){
-  const [token,setToken]=useState(""),[username,setUsername]=useState("id"),[password,setPassword]=useState("root");
+  const [token,setToken]=useState(""),[username,setUsername]=useState(""),[password,setPassword]=useState("");
   const [data,setData]=useState<Row|null>(null),[status,setStatus]=useState(""),[tab,setTab]=useState<"users"|"subscriptions">("users"),[busy,setBusy]=useState("");
   async function call(path:string,options:RequestInit={}){
-    const response=await fetch(`${API}${path}`,options);
+    let response:Response;try{response=await fetch(`${API}${path}`,options)}catch{throw new Error(`Cannot connect to the KiranaSaathi API at ${API}. Check VITE_API_URL and the backend deployment.`)}
     if(!response.ok){let body:any={};try{body=await response.json()}catch{}throw new Error(body.detail||"Request failed")}
     return response.json();
   }

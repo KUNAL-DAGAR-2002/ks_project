@@ -5,6 +5,10 @@ class EmailSignup(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8,max_length=128)
     name: str = Field(min_length=2,max_length=120)
+    business_name: str | None = Field(default=None,min_length=2,max_length=160)
+    city: str = Field(default="Not set",min_length=2,max_length=80)
+    pin_code: str = Field(default="110001",pattern=r"^[1-9]\d{5}$")
+    preferred_language: str = Field(default="en",pattern=r"^(en|hi|mr|gu|kn|ta)$")
 
 class EmailLogin(BaseModel):
     email: EmailStr

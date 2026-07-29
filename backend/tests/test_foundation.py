@@ -45,7 +45,7 @@ def test_explicit_login_and_signup_are_safe():
 
 def test_email_password_and_admin_authentication():
     email=f"owner-{uuid.uuid4().hex[:10]}@example.com"
-    signup=client.post("/api/auth/signup",json={"email":email,"password":"StrongPass123!","name":"Email Owner"})
+    signup=client.post("/api/auth/signup",json={"email":email,"password":"StrongPass123!","name":"Email Owner","business_name":"Email Owner Store","city":"Delhi","pin_code":"110001"})
     assert signup.status_code==201
     assert client.post("/api/auth/signup",json={"email":email,"password":"StrongPass123!","name":"Again"}).status_code==409
     assert client.post("/api/auth/login",json={"email":email,"password":"wrong"}).status_code==401
@@ -53,6 +53,8 @@ def test_email_password_and_admin_authentication():
     assert login.status_code==200
     me=client.get("/api/me",headers={"Authorization":f"Bearer {login.json()['access_token']}"}).json()
     assert me["email"]==email and "mobile" not in me
+    businesses=client.get("/api/businesses",headers={"Authorization":f"Bearer {login.json()['access_token']}"}).json()
+    assert len(businesses)==1 and businesses[0]["name"]=="Email Owner Store"
     assert client.post("/api/admin/login",json={"username":"id","password":"wrong"}).status_code==401
     admin=client.post("/api/admin/login",json={"username":"id","password":"root"})
     assert admin.status_code==200
@@ -61,14 +63,11 @@ def test_email_password_and_admin_authentication():
 
 def test_admin_can_manage_membership_and_delete_user():
     email=f"member-{uuid.uuid4().hex[:10]}@example.com"
-    signup=client.post("/api/auth/signup",json={"email":email,"password":"StrongPass123!","name":"Plan Member"})
+    signup=client.post("/api/auth/signup",json={"email":email,"password":"StrongPass123!","name":"Plan Member","business_name":"Plan Test Store","city":"Delhi","pin_code":"110001"})
     user_headers={"Authorization":f"Bearer {signup.json()['access_token']}"}
-    onboard=client.post("/api/onboarding",headers=user_headers,json={
-        "business_name":"Plan Test Store","store_name":"Main Store","city":"Delhi","state":"Delhi",
-        "pin_code":"110001","preferred_language":"en","working_style":[],"enabled_modules":[]
-    })
-    assert onboard.status_code==201
-    business_id=onboard.json()["id"]
+    businesses=client.get("/api/businesses",headers=user_headers)
+    assert businesses.status_code==200 and len(businesses.json())==1
+    business_id=businesses.json()[0]["id"]
     initial=client.get(f"/api/businesses/{business_id}/subscription",headers=user_headers)
     assert initial.status_code==200 and initial.json()["access_active"] is False and initial.json()["can_start_trial"] is True
     trial=client.post(f"/api/businesses/{business_id}/subscription/trial",headers=user_headers)

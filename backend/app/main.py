@@ -87,7 +87,15 @@ def email_signup(body:EmailSignup,db:Session=Depends(get_db)):
     email=str(body.email).strip().lower()
     if db.scalar(select(User.id).where(func.lower(User.email)==email)):raise HTTPException(409,"An account already exists for this email. Please log in.")
     user=User(mobile=f"E{__import__('uuid').uuid4().hex[:14]}",email=email,password_hash=hash_password(body.password),name=body.name.strip())
-    db.add(user);db.commit();db.refresh(user)
+    db.add(user);db.flush()
+    business_name=(body.business_name or f"{body.name.strip()}'s Store").strip()
+    business=Business(name=business_name,preferred_language=body.preferred_language,onboarding_complete=True)
+    db.add(business);db.flush()
+    membership=BusinessUser(business_id=business.id,user_id=user.id,role=Role.OWNER)
+    store=Store(business_id=business.id,name=business_name,city=body.city.strip(),state="Not set",pin_code=body.pin_code)
+    db.add_all([membership,store,Subscription(business_id=business.id,plan="starter",status="inactive",monthly_price=599),
+                AuditLog(business_id=business.id,user_id=user.id,action="create",entity="business",record_id=business.id)])
+    db.commit();db.refresh(user)
     return Token(access_token=create_token(user.id))
 
 @app.post("/api/auth/login",response_model=Token)
