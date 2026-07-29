@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     admin_username: str = "id"
     admin_password: str = "root"
     upload_dir: str = "./uploads"
+    cors_origins: str = "http://localhost:3000,http://localhost:5173"
     model_config = SettingsConfigDict(env_file=BACKEND_ENV, env_prefix="KIRANA_", extra="ignore")
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        return [origin.strip().rstrip("/") for origin in self.cors_origins.split(",") if origin.strip()]
 
 settings = Settings()

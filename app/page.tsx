@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 type Row=Record<string,any>;
-const API="http://localhost:8000/api";
+const API=(import.meta.env.VITE_API_URL||"http://localhost:8000/api").replace(/\/$/,"");
 const LANGUAGES=[
   {code:"en",label:"English"},{code:"hi",label:"हिन्दी"},{code:"mr",label:"मराठी"},
   {code:"gu",label:"ગુજરાતી"},{code:"kn",label:"ಕನ್ನಡ"},{code:"ta",label:"தமிழ்"}

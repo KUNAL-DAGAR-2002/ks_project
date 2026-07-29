@@ -12,7 +12,7 @@ from .security import create_admin_token, create_token, current_admin, current_u
 from .operations import router as operations_router
 
 app = FastAPI(title=settings.app_name, version="0.1.0", description="Milestone 1 foundation API")
-app.add_middleware(CORSMiddleware,allow_origins=["http://localhost:3000","http://localhost:5173"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
+app.add_middleware(CORSMiddleware,allow_origins=settings.allowed_origins,allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 Base.metadata.create_all(engine)
 user_columns={column["name"] for column in inspect(engine).get_columns("users")}
 if "email" not in user_columns:

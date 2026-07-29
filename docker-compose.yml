@@ -12,7 +12,9 @@ services:
     environment:
       KIRANA_DATABASE_URL: postgresql+psycopg://kirana:kirana_dev_only@db:5432/kirana_saathi
       KIRANA_JWT_SECRET: ${KIRANA_JWT_SECRET:-local-dev-secret-change-me}
-      KIRANA_GROQ_API_KEY: ${KIRANA_GROQ_API_KEY:-}
+      KIRANA_GEMINI_API_KEY: ${KIRANA_GEMINI_API_KEY:-}
+      KIRANA_GEMINI_MODEL: ${KIRANA_GEMINI_MODEL:-gemini-2.5-flash}
+      KIRANA_CORS_ORIGINS: ${KIRANA_CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
     depends_on: [db]
     volumes: [kirana_uploads:/app/uploads]
 volumes:

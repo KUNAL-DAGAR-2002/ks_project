@@ -2,7 +2,7 @@
 import {useEffect,useState} from "react";
 
 type Row=Record<string,any>;
-const API="http://localhost:8000/api";
+const API=(import.meta.env.VITE_API_URL||"http://localhost:8000/api").replace(/\/$/,"");
 const number=(value:unknown)=>Number(value||0).toLocaleString("en-IN");
 const date=(value:string|null)=>value?new Date(value).toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"}):"—";
 

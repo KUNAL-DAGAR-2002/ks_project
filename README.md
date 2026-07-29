@@ -51,3 +51,28 @@ docker compose up --build
 ## Current production gaps
 
 This repository is a broad end-to-end MVP, not a claim of enterprise completeness. Before public production: connect an SMS OTP provider; move uploads to private S3/Supabase storage; replace development `create_all` with reviewed Alembic migrations; add malware scanning and background workers; expand browser E2E coverage; add PDF/Excel report endpoints; enforce image usage counters; and deploy the FastAPI/PostgreSQL services separately from the Sites frontend.
+
+## Render deployment
+
+The repository includes `render.yaml` for a Render Blueprint with the FastAPI
+backend and Vinext frontend. Connect an existing Render PostgreSQL database by
+supplying its URL as `KIRANA_DATABASE_URL`.
+
+Before the first deploy, provide these secret values in Render:
+
+- `KIRANA_GEMINI_API_KEY`
+- `KIRANA_DATABASE_URL`
+- `KIRANA_ADMIN_USERNAME`
+- `KIRANA_ADMIN_PASSWORD`
+- `KIRANA_CORS_ORIGINS` — the deployed frontend origin, for example
+  `https://kirana-saathi.onrender.com`
+- `VITE_API_URL` — the deployed backend API URL, for example
+  `https://kirana-saathi-api.onrender.com/api`
+
+The backend accepts Render's standard `postgresql://` connection URL and
+automatically selects the installed Psycopg 3 driver. Both web services bind to
+Render's supplied `PORT`.
+
+Render filesystems are ephemeral. For durable uploaded source images, attach a
+persistent disk to the backend at `/opt/render/project/src/uploads`. Confirmed
+business records remain in Render PostgreSQL regardless.
