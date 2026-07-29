@@ -6,7 +6,7 @@ test("KiranaSaathi ships product-specific accessible content", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.doesNotMatch(page, /Namaste, \$\{currentUser\?\.name\|\|name\}/);
   assert.doesNotMatch(page, /Live business data/);
-  assert.match(page, /Daily sales/);
+  assert.match(page, /sales line chart/);
   assert.match(page, /Stock aur report update ho gaye/);
   assert.match(page, /Reports/);
   assert.match(page, /Choose sales image or CSV/);
