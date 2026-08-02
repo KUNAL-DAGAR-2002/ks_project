@@ -338,6 +338,8 @@ def post_sale(business_id:str,body:SaleIn,user:User=Depends(current_user),db:Ses
         p=products[x.product_id]; cost_known=p.purchase_cost>0; db.add(SaleLine(business_id=business_id,sale_id=sale.id,product_id=p.id,quantity=x.quantity,unit_price=x.unit_price,unit_cost=p.purchase_cost,cost_known=cost_known,net=x.quantity*x.unit_price)); db.add(InventoryMovement(business_id=business_id,store_id=body.store_id,product_id=p.id,movement_type="sale",quantity_base=-x.quantity,unit_cost=p.purchase_cost,reference_type="sale",reference_id=sale.id,created_by=user.id,transaction_date=posted_at))
     if body.payment_mode=="customer_credit" and body.customer_id:
         db.add(LedgerEntry(business_id=business_id,party_type="customer",party_id=body.customer_id,entry_type="credit_sale",amount=sale.net,reference_id=sale.id,created_by=user.id,created_at=posted_at))
+    db.flush()
+    for product_id in products:recalculate_product_sale_costs(db,business_id,product_id)
     audit(db,business_id,user,"post","sale",sale.id); db.commit(); return sale
 
 @router.post("/businesses/{business_id}/sales/by-name",status_code=201)
@@ -364,8 +366,39 @@ def post_sale_by_name(business_id:str,body:NamedSaleIn,user:User=Depends(current
         db.add(InventoryMovement(business_id=business_id,store_id=body.store_id,product_id=product.id,movement_type="sale",quantity_base=-line.quantity,unit_cost=product.purchase_cost,reference_type="sale",reference_id=sale.id,created_by=user.id,transaction_date=posted_at,notes=None if cost_known else "Sale recorded before purchase cost was available"))
     if body.payment_mode=="customer_credit" and body.customer_id:
         db.add(LedgerEntry(business_id=business_id,party_type="customer",party_id=body.customer_id,entry_type="credit_sale",amount=sale.net,reference_id=sale.id,created_by=user.id,created_at=posted_at))
+    db.flush()
+    for product_id in {product.id for product,_ in resolved}:recalculate_product_sale_costs(db,business_id,product_id)
+    profit_excluded_lines=int(db.scalar(select(func.count(SaleLine.id)).where(SaleLine.sale_id==sale.id,SaleLine.cost_known.is_(False))) or 0)
     audit(db,business_id,user,"post_by_name","sale",sale.id);db.commit()
-    return {"id":sale.id,"net":sale.net,"created_products":created_count,"profit_excluded_lines":sum(not product.purchase_cost for product,_ in resolved)}
+    return {"id":sale.id,"net":sale.net,"created_products":created_count,"profit_excluded_lines":profit_excluded_lines}
+
+def recalculate_product_sale_costs(db:Session,business_id:str,product_id:str)->None:
+    """Attach the latest purchase cost available on each sale's date.
+
+    Purchases and sales can be uploaded in any order. Replaying the small
+    per-product cost timeline makes profit independent of upload order while
+    ensuring a future purchase price is never applied to an earlier sale.
+    """
+    purchases=db.execute(
+        select(Purchase.created_at,PurchaseLine.unit_cost)
+        .join(PurchaseLine,PurchaseLine.purchase_id==Purchase.id)
+        .where(Purchase.business_id==business_id,PurchaseLine.product_id==product_id)
+        .order_by(Purchase.created_at,PurchaseLine.id)
+    ).all()
+    product=db.scalar(select(Product).where(Product.id==product_id,Product.business_id==business_id))
+    if product:product.purchase_cost=float(purchases[-1].unit_cost) if purchases else 0
+    sales=db.execute(
+        select(SaleLine,Sale.created_at).join(Sale,Sale.id==SaleLine.sale_id)
+        .where(SaleLine.business_id==business_id,SaleLine.product_id==product_id)
+        .order_by(Sale.created_at,SaleLine.id)
+    ).all()
+    purchase_index=-1
+    for line,sold_at in sales:
+        while purchase_index+1<len(purchases) and purchases[purchase_index+1].created_at<=sold_at:purchase_index+=1
+        if purchase_index>=0:
+            line.unit_cost=float(purchases[purchase_index].unit_cost);line.cost_known=True
+        else:
+            line.unit_cost=0;line.cost_known=False
 
 @router.post("/businesses/{business_id}/purchases",status_code=201)
 def post_purchase(business_id:str,body:PurchaseIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
@@ -381,6 +414,8 @@ def post_purchase(business_id:str,body:PurchaseIn,user:User=Depends(current_user
     for x in body.lines:
         product=products[x.product_id]; product.purchase_cost=x.unit_price
         db.add(PurchaseLine(business_id=business_id,purchase_id=purchase.id,product_id=x.product_id,quantity=x.quantity,unit_cost=x.unit_price,total=x.quantity*x.unit_price)); db.add(InventoryMovement(business_id=business_id,store_id=body.store_id,product_id=x.product_id,movement_type="purchase_receipt",quantity_base=x.quantity,unit_cost=x.unit_price,reference_type="purchase",reference_id=purchase.id,created_by=user.id,transaction_date=posted_at))
+    db.flush()
+    for product_id in {line.product_id for line in body.lines}:recalculate_product_sale_costs(db,business_id,product_id)
     if total>paid: db.add(LedgerEntry(business_id=business_id,party_type="supplier",party_id=body.supplier_id,entry_type="purchase_credit",amount=total-paid,reference_id=purchase.id,created_by=user.id,created_at=posted_at))
     audit(db,business_id,user,"post","purchase",purchase.id); db.commit(); return purchase
 
@@ -574,12 +609,16 @@ def edit_purchase_line(business_id:str,purchase_id:str,line_id:str,body:Transact
         if credit:credit.amount=purchase.total
         else:db.add(LedgerEntry(business_id=business_id,party_type="supplier",party_id=purchase.supplier_id,entry_type="purchase_credit",amount=purchase.total,reference_id=purchase.id,created_by=user.id,created_at=purchase.created_at))
     elif credit:db.delete(credit)
+    db.flush();recalculate_product_sale_costs(db,business_id,line.product_id)
     audit(db,business_id,user,"update","purchase",purchase.id);db.commit();return {"updated":True,"purchase_total":purchase.total,"purchase_id":purchase.id,"line_id":line.id,"payment_mode":purchase.payment_mode}
 @router.delete("/businesses/{business_id}/purchases/{purchase_id}")
 def delete_purchase(business_id:str,purchase_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id,{"owner","manager"});purchase=db.scalar(select(Purchase).where(Purchase.id==purchase_id,Purchase.business_id==business_id))
     if not purchase:raise HTTPException(404,"Purchase not found")
-    db.execute(delete(InventoryMovement).where(InventoryMovement.business_id==business_id,InventoryMovement.reference_id==purchase_id));db.execute(delete(LedgerEntry).where(LedgerEntry.business_id==business_id,LedgerEntry.reference_id==purchase_id));db.execute(delete(PurchaseLine).where(PurchaseLine.business_id==business_id,PurchaseLine.purchase_id==purchase_id));audit(db,business_id,user,"delete","purchase",purchase.id);db.delete(purchase);db.commit();return {"deleted":True}
+    product_ids=set(db.scalars(select(PurchaseLine.product_id).where(PurchaseLine.business_id==business_id,PurchaseLine.purchase_id==purchase_id)))
+    db.execute(delete(InventoryMovement).where(InventoryMovement.business_id==business_id,InventoryMovement.reference_id==purchase_id));db.execute(delete(LedgerEntry).where(LedgerEntry.business_id==business_id,LedgerEntry.reference_id==purchase_id));db.execute(delete(PurchaseLine).where(PurchaseLine.business_id==business_id,PurchaseLine.purchase_id==purchase_id));audit(db,business_id,user,"delete","purchase",purchase.id);db.delete(purchase);db.flush()
+    for product_id in product_ids:recalculate_product_sale_costs(db,business_id,product_id)
+    db.commit();return {"deleted":True}
 @router.delete("/businesses/{business_id}/purchases/{purchase_id}/lines/{line_id}")
 def delete_purchase_line(business_id:str,purchase_id:str,line_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id,{"owner","manager"});purchase=db.scalar(select(Purchase).where(Purchase.id==purchase_id,Purchase.business_id==business_id));line=db.scalar(select(PurchaseLine).where(PurchaseLine.id==line_id,PurchaseLine.purchase_id==purchase_id,PurchaseLine.business_id==business_id))
@@ -592,6 +631,7 @@ def delete_purchase_line(business_id:str,purchase_id:str,line_id:str,user:User=D
         if credit:credit.amount=max(0,purchase.total-purchase.paid)
     else:
         db.execute(delete(LedgerEntry).where(LedgerEntry.business_id==business_id,LedgerEntry.reference_id==purchase_id));db.delete(purchase)
+    db.flush();recalculate_product_sale_costs(db,business_id,line.product_id)
     audit(db,business_id,user,"delete_line","purchase",purchase_id);db.commit();return {"deleted":True,"transaction_deleted":not bool(remaining)}
 @router.get("/businesses/{business_id}/expenses")
 def expense_list(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)): member(db,user,business_id); return db.scalars(select(Expense).where(Expense.business_id==business_id).order_by(Expense.created_at.desc()).limit(100)).all()
@@ -818,6 +858,8 @@ def confirm_image(business_id:str,document_id:str,user:User=Depends(current_user
         if not lines: raise HTTPException(409,"No confirmed sale rows")
         gross=sum(q*p for _,q,p in lines); sale=Sale(business_id=business_id,store_id=row.store_id,invoice_number=f"IMG-{row.id[:8]}",payment_mode="cash",gross=gross,discount=0,net=gross,created_by=user.id); db.add(sale); db.flush(); created_id=sale.id
         for product,qty,price in lines: db.add(SaleLine(business_id=business_id,sale_id=sale.id,product_id=product.id,quantity=qty,unit_price=price,unit_cost=product.purchase_cost,cost_known=product.purchase_cost>0,net=qty*price)); db.add(InventoryMovement(business_id=business_id,store_id=row.store_id,product_id=product.id,movement_type="sale",quantity_base=-qty,unit_cost=product.purchase_cost,reference_type="image_sale",reference_id=sale.id,created_by=user.id))
+        db.flush()
+        for product_id in {product.id for product,_,_ in lines}:recalculate_product_sale_costs(db,business_id,product_id)
     row.status="confirmed"; row.confirmed_by=user.id; audit(db,business_id,user,"confirm_and_post","image_document",row.id); db.commit(); return {"id":row.id,"status":"confirmed","created_transaction_id":created_id}
 
 @router.post("/businesses/{business_id}/imports/products")

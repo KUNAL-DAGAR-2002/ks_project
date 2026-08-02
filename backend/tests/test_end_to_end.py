@@ -67,7 +67,7 @@ def test_complete_manual_business_flow():
     bad=client.post(f"/api/businesses/{bid}/imports/products?store_id={sid}",headers=h,files={"file":("bad.csv",b"wrong,data\n1,2","text/csv")}); assert bad.status_code==422
 
 
-def test_daily_sale_creates_missing_product_and_excludes_unknown_cost_from_profit():
+def test_daily_sale_creates_product_and_backfills_profit_when_purchase_arrives():
     h={"Authorization":f"Bearer {token()}"}
     business=client.post("/api/onboarding",headers=h,json={"business_name":"Fast Sales Kirana","store_name":"Main","city":"Delhi","state":"Delhi","pin_code":"110001","preferred_language":"en"}).json()
     bid=business["id"]
@@ -84,7 +84,9 @@ def test_daily_sale_creates_missing_product_and_excludes_unknown_cost_from_profi
     supplier=client.post(f"/api/businesses/{bid}/suppliers",headers=h,json={"name":"Fast Supplier"}).json()
     purchase=client.post(f"/api/businesses/{bid}/purchases",headers=h,json={"store_id":sid,"supplier_id":supplier["id"],"invoice_number":"COST-1","payment_mode":"cash","lines":[{"product_id":product["id"],"quantity":5,"unit_price":30}]})
     assert purchase.status_code==201
+    detail=next(row for row in client.get(f"/api/businesses/{bid}/sales-details",headers=h).json() if row["product_name"]==product_name)
+    assert detail["cost_known"] is True and detail["profit_loss"]==40
     second=client.post(f"/api/businesses/{bid}/sales/by-name",headers=h,json={"store_id":sid,"invoice_number":"DIRECT-2","payment_mode":"upi","lines":[{"name":product_name,"quantity":2,"total_price":80,"unit":"packet"}]})
     assert second.status_code==201 and second.json()["created_products"]==0 and second.json()["profit_excluded_lines"]==0
     daily=client.get(f"/api/businesses/{bid}/sales-daily",headers=h).json()[0]
-    assert daily["total_sales"]==180 and daily["profit"]==20
+    assert daily["total_sales"]==180 and daily["profit"]==60
