@@ -38,3 +38,5 @@ services:
         value: 22.13.0
       - key: VITE_API_URL
         sync: false
+      - key: KIRANA_BACKEND_URL
+        value: https://kirana-saathi-api.onrender.com
