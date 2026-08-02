@@ -1,4 +1,4 @@
-import csv, difflib, io, os, re, uuid
+import csv, difflib, io, os, re, unicodedata, uuid
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -189,8 +189,51 @@ def product_unit_map(business_id:str,user:User=Depends(current_user),db:Session=
     member(db,user,business_id)
     return db.scalars(select(ProductUnitMap).order_by(ProductUnitMap.display_name)).all()
 
+_PACKAGE_WORDS={"pack","packs","packed","packet","packets","bag","bags","pouch","pouches","bottle","bottles","box","boxes","piece","pieces","pcs","pc"}
+_LOOSE_WORDS={"loose","open","opened","unpacked"}
+
+def standardized_product_display_name(value:str)->str:
+    """Return one stable, human-readable spelling before a product is stored."""
+    text=unicodedata.normalize("NFKC",value).strip()
+    text=re.sub(r"[‐‑‒–—―]+","-",text)
+    text=re.sub(r"\s+-+\s+"," — ",text)
+    text=re.sub(r"\b(kilograms?|kgs?)\b","kg",text,flags=re.I)
+    text=re.sub(r"\b(grams?|gms?)\b","g",text,flags=re.I)
+    text=re.sub(r"\b(litres?|liters?|ltrs?)\b","L",text,flags=re.I)
+    text=re.sub(r"\b(millilitres?|milliliters?|mls?)\b","ml",text,flags=re.I)
+    return re.sub(r"\s+"," ",text).strip(" -—")
+
+def product_match_parts(value:str)->tuple[str,str,tuple[str,...]]:
+    """Canonical identity preserving the distinctions that affect costing."""
+    text=standardized_product_display_name(value).casefold()
+    form="loose" if any(re.search(rf"\b{word}\b",text) for word in _LOOSE_WORDS) else "packed" if any(re.search(rf"\b{word}\b",text) for word in _PACKAGE_WORDS) else "unspecified"
+    sizes=[]
+    for number,unit in re.findall(r"\b(\d+(?:\.\d+)?)\s*(kg|g|l|ml)\b",text):
+        size=f"{float(number):g}{unit}"
+        if size not in sizes:sizes.append(size)
+    text=re.sub(r"\b\d+(?:\.\d+)?\s*(?:kg|g|l|ml)\b"," ",text)
+    for word in (*_PACKAGE_WORDS,*_LOOSE_WORDS):text=re.sub(rf"\b{word}\b"," ",text)
+    base=re.sub(r"[^a-z0-9\u0900-\u097f]+","",text)
+    return base,form,tuple(sizes)
+
 def normalized_product_name(value:str)->str:
-    return re.sub(r"[^a-z0-9\u0900-\u097f]+","",value.casefold())
+    base,form,sizes=product_match_parts(value)
+    return f"{base}|{form}|{'/'.join(sizes)}"
+
+def product_name_similarity(entered:str,candidate:str)->float:
+    left,left_form,left_sizes=product_match_parts(entered);right,right_form,right_sizes=product_match_parts(candidate)
+    if not left or not right:return 0
+    if left_form!=right_form and "unspecified" not in {left_form,right_form}:return 0
+    if left_sizes and right_sizes and left_sizes!=right_sizes:return 0
+    return difflib.SequenceMatcher(None,left,right).ratio()
+
+def find_matching_product(label:str,products:list[Product])->tuple[Product|None,float]:
+    best=None;best_score=0.0
+    for product in products:
+        for candidate in (product.name,product.local_name or ""):
+            score=product_name_similarity(label,candidate)
+            if score>best_score:best,best_score=product,score
+    return best,best_score
 
 def fast_resolve_sales_product(db:Session,business_id:str,store_id:str,label:str,unit:str|None,products:list[Product])->tuple[Product,bool]:
     """Resolve a sales product without an external AI call.
@@ -200,31 +243,23 @@ def fast_resolve_sales_product(db:Session,business_id:str,store_id:str,label:str
     the cleaned label; close spelling variants are matched locally and truly
     new products are created with an unknown purchase cost.
     """
-    normalized=normalized_product_name(label)
+    label=standardized_product_display_name(label);normalized=normalized_product_name(label)
     for product in products:
         if normalized in {normalized_product_name(product.name),normalized_product_name(product.local_name or "")}:
             return product,False
     aliases=db.execute(select(ProductAlias,Product).join(Product,Product.id==ProductAlias.product_id).where(ProductAlias.business_id==business_id,Product.active.is_(True))).all()
     for alias,product in aliases:
         if normalized_product_name(alias.alias)==normalized:return product,False
-    entered_numbers=re.findall(r"\d+(?:\.\d+)?",label)
-    scored=[]
-    for product in products:
-        candidate_numbers=re.findall(r"\d+(?:\.\d+)?",product.name)
-        if entered_numbers and candidate_numbers and entered_numbers!=candidate_numbers:continue
-        score=difflib.SequenceMatcher(None,normalized,normalized_product_name(product.name)).ratio()
-        scored.append((score,product))
-    if scored:
-        score,product=max(scored,key=lambda item:item[0])
-        if score>=0.88:
-            db.add(ProductAlias(business_id=business_id,product_id=product.id,alias=label.strip()))
-            return product,False
+    product,score=find_matching_product(label,products)
+    if product and score>=0.84:
+        db.add(ProductAlias(business_id=business_id,product_id=product.id,alias=label))
+        return product,False
     category_name=fallback_category(label)
     category=db.scalar(select(Category).where(Category.business_id==business_id,func.lower(Category.name)==category_name.lower()))
     if not category:
         category=Category(business_id=business_id,name=category_name);db.add(category);db.flush()
     resolved_unit=fallback_unit(label,unit)
-    product=Product(business_id=business_id,store_id=store_id,code=f"SALE-{uuid.uuid4().hex[:8].upper()}",name=label.strip(),category_id=category.id,base_unit=resolved_unit,purchase_unit=resolved_unit,selling_unit=resolved_unit,conversion_factor=1,mrp=0,selling_price=0,purchase_cost=0,reorder_level=0)
+    product=Product(business_id=business_id,store_id=store_id,code=f"SALE-{uuid.uuid4().hex[:8].upper()}",name=label,category_id=category.id,base_unit=resolved_unit,purchase_unit=resolved_unit,selling_unit=resolved_unit,conversion_factor=1,mrp=0,selling_price=0,purchase_cost=0,reorder_level=0)
     db.add(product);db.flush();products.append(product)
     return product,True
 
@@ -256,7 +291,9 @@ async def match_product(business_id:str,body:MatchProductIn,user:User=Depends(cu
 
 @router.post("/businesses/{business_id}/products/resolve")
 async def resolve_product(business_id:str,body:ResolveProductIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    member(db,user,business_id); label=body.name.strip(); product=db.scalar(select(Product).where(Product.business_id==business_id,func.lower(Product.name)==label.lower()))
+    member(db,user,business_id); label=standardized_product_display_name(body.name); products=list(db.scalars(select(Product).where(Product.business_id==business_id)))
+    product,score=find_matching_product(label,products)
+    if score<0.84:product=None
     if not product:
         alias=db.scalar(select(ProductAlias).where(ProductAlias.business_id==business_id,func.lower(ProductAlias.alias)==label.lower())); product=db.get(Product,alias.product_id) if alias else None
     if product:
@@ -832,8 +869,9 @@ async def extract_image(business_id:str,document_id:str,user:User=Depends(curren
     if row.status=="review_required":return {"id":row.id,"status":row.status,"data":row.structured_data}
     if row.status=="processing":raise HTTPException(409,"This image is already being processed.")
     storage_path,mime_type,document_type=row.storage_path,row.mime_type,row.document_type
+    existing_products=list(db.scalars(select(Product.name).where(Product.business_id==business_id,Product.active.is_(True)).order_by(Product.name).limit(300)))
     row.status="processing";db.commit()  # release the DB connection during the external AI request
-    try: data=await tracked_provider(business_id,user.id,f"image_{document_type}").extract(storage_path,mime_type,document_type)
+    try: data=await tracked_provider(business_id,user.id,f"image_{document_type}").extract(storage_path,mime_type,document_type,existing_products)
     except RuntimeError as exc:
         row=db.scalar(select(ImageDocument).where(ImageDocument.id==document_id,ImageDocument.business_id==business_id));row.status="failed"; db.commit(); raise HTTPException(502,f"AI extraction failed: {exc}") from exc
     except Exception as exc:
