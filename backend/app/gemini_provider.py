@@ -42,13 +42,20 @@ class GeminiProvider:
         parts = [{"text": prompt}]
         if image:
             mime, data = image; parts.append({"inline_data": {"mime_type": mime, "data": data}})
-        payload: dict = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"temperature": 0, "maxOutputTokens": max_tokens, "thinkingConfig": {"thinkingBudget": 0}}}
+        payload: dict = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"maxOutputTokens": max_tokens, "thinkingConfig": {"thinkingBudget": 0}}}
         if search: payload["tools"] = [{"google_search": {}}]
         else: payload["generationConfig"]["responseMimeType"] = "application/json"
+        configured_model = settings.gemini_model.strip() or "gemini-3.5-flash"
+        models = [configured_model]
+        if configured_model != "gemini-flash-latest": models.append("gemini-flash-latest")
         async with httpx.AsyncClient(timeout=45) as client:
-            response = await client.post(f"{self.endpoint}/{settings.gemini_model}:generateContent", headers={"x-goog-api-key": settings.gemini_api_key}, json=payload)
-            try: response.raise_for_status()
-            except httpx.HTTPStatusError as exc: self._raise_api_error(exc)
+            for index, model in enumerate(models):
+                response = await client.post(f"{self.endpoint}/{model}:generateContent", headers={"x-goog-api-key": settings.gemini_api_key}, json=payload)
+                if response.status_code == 404 and index + 1 < len(models):
+                    continue
+                try: response.raise_for_status()
+                except httpx.HTTPStatusError as exc: self._raise_api_error(exc)
+                break
         body = response.json()
         if self.usage_recorder:
             usage=body.get("usageMetadata",{})
