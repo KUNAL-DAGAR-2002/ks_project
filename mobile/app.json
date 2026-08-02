@@ -1,0 +1,31 @@
+{
+  "expo": {
+    "name": "KiranaSaathi",
+    "slug": "kirana-saathi",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "kiranasaathi",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.kiranasaathi.mobile",
+      "infoPlist": {
+        "NSCameraUsageDescription": "KiranaSaathi uses the camera to scan sales, purchase and udhaar records.",
+        "NSPhotoLibraryUsageDescription": "KiranaSaathi uses selected photos to extract business entries.",
+        "NSMicrophoneUsageDescription": "KiranaSaathi listens only while you use voice entry.",
+        "NSSpeechRecognitionUsageDescription": "KiranaSaathi converts your spoken business entries into text for your review."
+      }
+    },
+    "android": {
+      "package": "com.kiranasaathi.mobile",
+      "adaptiveIcon": { "backgroundColor": "#EAF6EF" },
+      "permissions": ["CAMERA", "RECORD_AUDIO"]
+    },
+    "plugins": [
+      ["expo-image-picker", {"photosPermission": "Choose kirana bills and register photos for extraction.", "cameraPermission": "Take a photo of a kirana bill or register.", "microphonePermission": false}],
+      "expo-secure-store",
+      "expo-speech-recognition"
+    ],
+    "extra": {"supportsVoiceReview": true}
+  }
+}

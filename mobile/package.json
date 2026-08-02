@@ -1,0 +1,32 @@
+{
+  "name": "kirana-saathi-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "main": "expo/AppEntry",
+  "scripts": {
+    "start": "expo start --dev-client",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "typecheck": "tsc --noEmit",
+    "doctor": "expo-doctor",
+    "build:android": "eas build --platform android --profile production",
+    "build:ios": "eas build --platform ios --profile production"
+  },
+  "dependencies": {
+    "@expo/vector-icons": "15.1.1",
+    "expo": "57.0.9",
+    "expo-font": "~57.0.1",
+    "expo-image-picker": "57.0.7",
+    "expo-secure-store": "57.0.1",
+    "expo-speech": "57.0.1",
+    "expo-speech-recognition": "56.0.1",
+    "expo-status-bar": "~57.0.0",
+    "react": "19.2.3",
+    "react-native": "0.86.2",
+    "react-native-safe-area-context": "~5.7.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.0",
+    "typescript": "~6.0.3"
+  }
+}
