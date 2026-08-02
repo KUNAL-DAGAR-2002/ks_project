@@ -61,6 +61,19 @@ def test_email_password_and_admin_authentication():
     overview=client.get("/api/admin/overview",headers={"Authorization":f"Bearer {admin.json()['access_token']}"})
     assert overview.status_code==200 and "users" in overview.json() and "ai_tokens" in overview.json()["summary"]
 
+def test_fresh_email_account_can_load_complete_dashboard():
+    email=f"fresh-{uuid.uuid4().hex[:10]}@example.com"
+    signup=client.post("/api/auth/signup",json={"email":email,"password":"StrongPass123!","name":"Fresh Owner","business_name":"Fresh Store","city":"Delhi","pin_code":"110001"})
+    assert signup.status_code==201
+    headers={"Authorization":f"Bearer {signup.json()['access_token']}"}
+    businesses=client.get("/api/businesses",headers=headers)
+    assert businesses.status_code==200 and len(businesses.json())==1
+    business_id=businesses.json()[0]["id"]
+    paths=["stores","products","inventory","customers","suppliers","ledger?party_type=customer","purchases","sales","sales-daily","sales-products-daily","expenses","dashboard","subscription"]
+    for path in paths:
+        response=client.get(f"/api/businesses/{business_id}/{path}",headers=headers)
+        assert response.status_code==200, f"{path}: {response.text}"
+
 def test_admin_can_manage_membership_and_delete_user():
     email=f"member-{uuid.uuid4().hex[:10]}@example.com"
     signup=client.post("/api/auth/signup",json={"email":email,"password":"StrongPass123!","name":"Plan Member","business_name":"Plan Test Store","city":"Delhi","pin_code":"110001"})
