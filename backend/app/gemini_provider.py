@@ -42,7 +42,7 @@ class GeminiProvider:
         parts = [{"text": prompt}]
         if image:
             mime, data = image; parts.append({"inline_data": {"mime_type": mime, "data": data}})
-        payload: dict = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"maxOutputTokens": max_tokens, "thinkingConfig": {"thinkingBudget": 0}}}
+        payload: dict = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"maxOutputTokens": max_tokens}}
         if search: payload["tools"] = [{"google_search": {}}]
         else: payload["generationConfig"]["responseMimeType"] = "application/json"
         configured_model = settings.gemini_model.strip() or "gemini-3.5-flash"
@@ -50,9 +50,17 @@ class GeminiProvider:
         if configured_model != "gemini-flash-latest": models.append("gemini-flash-latest")
         async with httpx.AsyncClient(timeout=45) as client:
             for index, model in enumerate(models):
+                generation_config = payload["generationConfig"]
+                generation_config["thinkingConfig"] = ({"thinkingBudget": 0} if "gemini-2.5" in model else {"thinkingLevel": "minimal"})
                 response = await client.post(f"{self.endpoint}/{model}:generateContent", headers={"x-goog-api-key": settings.gemini_api_key}, json=payload)
                 if response.status_code == 404 and index + 1 < len(models):
                     continue
+                if response.status_code == 400:
+                    # Some API/model combinations reject thinking controls even
+                    # though generation itself is supported. Retry once using
+                    # only the universally supported generation fields.
+                    generation_config.pop("thinkingConfig", None)
+                    response = await client.post(f"{self.endpoint}/{model}:generateContent", headers={"x-goog-api-key": settings.gemini_api_key}, json=payload)
                 try: response.raise_for_status()
                 except httpx.HTTPStatusError as exc: self._raise_api_error(exc)
                 break
