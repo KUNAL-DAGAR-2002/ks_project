@@ -125,7 +125,7 @@ class Sale(Base):
 
 class SaleLine(Base):
     __tablename__ = "sale_lines"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); business_id: Mapped[str] = mapped_column(ForeignKey("businesses.id"), index=True); sale_id: Mapped[str] = mapped_column(ForeignKey("sales.id"), index=True); product_id: Mapped[str] = mapped_column(ForeignKey("products.id")); quantity: Mapped[float] = mapped_column(Float); unit_price: Mapped[float] = mapped_column(Float); unit_cost: Mapped[float] = mapped_column(Float); net: Mapped[float] = mapped_column(Float)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); business_id: Mapped[str] = mapped_column(ForeignKey("businesses.id"), index=True); sale_id: Mapped[str] = mapped_column(ForeignKey("sales.id"), index=True); product_id: Mapped[str] = mapped_column(ForeignKey("products.id")); quantity: Mapped[float] = mapped_column(Float); unit_price: Mapped[float] = mapped_column(Float); unit_cost: Mapped[float] = mapped_column(Float); cost_known: Mapped[bool] = mapped_column(Boolean, default=False); net: Mapped[float] = mapped_column(Float)
 
 class Purchase(Base):
     __tablename__ = "purchases"; __table_args__ = (UniqueConstraint("business_id", "supplier_id", "invoice_number"),)

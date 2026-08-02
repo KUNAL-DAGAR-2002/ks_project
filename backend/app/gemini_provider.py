@@ -1,7 +1,8 @@
-import asyncio, base64, json, re
+import asyncio, base64, io, json, re
 from datetime import datetime, timezone
 from pathlib import Path
 import httpx
+from PIL import Image, ImageOps
 from .config import settings
 
 class GeminiProvider:
@@ -12,6 +13,27 @@ class GeminiProvider:
 
     def __init__(self, usage_recorder=None):
         self.usage_recorder = usage_recorder
+
+    @staticmethod
+    def _optimized_image(path: str, mime: str) -> tuple[str, str]:
+        """Shrink phone photos before sending them to Gemini.
+
+        Bills remain easily readable at 2048 px while upload transfer and
+        multimodal preprocessing are substantially faster than for raw
+        multi-megabyte camera images.
+        """
+        original=Path(path).read_bytes()
+        try:
+            with Image.open(io.BytesIO(original)) as source:
+                image=ImageOps.exif_transpose(source)
+                image.thumbnail((2048,2048),Image.Resampling.LANCZOS)
+                if image.mode not in {"RGB","L"}:image=image.convert("RGB")
+                output=io.BytesIO();image.save(output,format="JPEG",quality=84,optimize=True)
+                optimized=output.getvalue()
+            if len(optimized)<len(original):return "image/jpeg",base64.b64encode(optimized).decode()
+        except Exception:
+            pass
+        return mime,base64.b64encode(original).decode()
 
     @staticmethod
     def _raise_api_error(exc: httpx.HTTPStatusError) -> None:
@@ -37,7 +59,7 @@ class GeminiProvider:
                 continue
         raise RuntimeError("Gemini returned invalid structured data.")
 
-    async def _generate(self, prompt: str, *, image: tuple[str, str] | None = None, search: bool = False, max_tokens: int = 1600) -> tuple[dict, dict]:
+    async def _generate(self, prompt: str, *, image: tuple[str, str] | None = None, search: bool = False, max_tokens: int = 1600, model: str | None = None) -> tuple[dict, dict]:
         if not settings.gemini_api_key: raise RuntimeError("KIRANA_GEMINI_API_KEY is not configured")
         parts = [{"text": prompt}]
         if image:
@@ -45,7 +67,7 @@ class GeminiProvider:
         payload: dict = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"maxOutputTokens": max_tokens}}
         if search: payload["tools"] = [{"google_search": {}}]
         else: payload["generationConfig"]["responseMimeType"] = "application/json"
-        configured_model = settings.gemini_model.strip() or "gemini-3.5-flash"
+        configured_model = (model or settings.gemini_model).strip() or "gemini-3.5-flash"
         models = [configured_model]
         if configured_model != "gemini-flash-latest": models.append("gemini-flash-latest")
         async with httpx.AsyncClient(timeout=45) as client:
@@ -77,7 +99,7 @@ class GeminiProvider:
         return self._parse_json(text), body
 
     async def extract(self, path: str, mime: str, document_type: str) -> dict:
-        data = base64.b64encode(Path(path).read_bytes()).decode()
+        mime,data = await asyncio.to_thread(self._optimized_image,path,mime)
         if document_type == "udhaar":
             rows = [{"date":"","customer_name":"","products":"","amount":0,"total_present":False,"given":0,"confidence":0}]
         elif document_type == "supplier_payment":
@@ -89,7 +111,7 @@ class GeminiProvider:
 For an udhaar image, split customer entries when there are two blank lines or another clear large separator. Return one row per customer block. Each row must contain date in YYYY-MM-DD format, customer_name, products as one comma-separated string that keeps product quantities, amount as the explicitly written cumulative Total Udhaar, total_present true only when that cumulative total is visibly written, and given as the explicitly written cumulative Paid total. Total Udhaar and Paid are lifetime-to-date customer totals, never transaction amounts. If Total Udhaar is absent, return amount 0 and total_present false so the app carries forward the customer's stored total. Product quantities never imply a rupee amount. A payment-only block may omit Date; leave date empty so the app uses the current date. Do not calculate Pending; the app calculates Total Udhaar minus Paid.
 For a supplier_payment image, return one row per clearly separated dealer payment block. Extract date in YYYY-MM-DD format, dealer_name exactly as written, and amount_paid as the payment made on that date. This is a payment transaction, not a cumulative lifetime Paid value. Never treat a customer payment as a dealer payment and never invent a missing amount.
 Row price is the total for the complete row, not unit price. Extract payment_mode only as cash, upi, or udhaar. Treat Credit as udhaar. If payment mode is absent or unclear, return cash. Do not return card. For sugar, salt, rice, atta/flour, dal, pulses and similar weight-based staples, classify trade_form as packed or loose when the document provides evidence. Packet/pouch/piece/bottle or an explicit branded fixed pack means packed. A quantity measured directly in kg/g without packaging usually means loose. If packed versus loose is genuinely unclear, set trade_form to loose and form_confidence to assumed so the shopkeeper can correct it. Use form_confidence confirmed only when the document supports the choice. Extract pack_size and pack_unit when present. For other products use trade_form standard. Never invent unreadable values; use empty strings or zero and low confidence."""
-        result, _ = await self._generate(prompt, image=(mime, data)); return result
+        result, _ = await self._generate(prompt, image=(mime, data), model=settings.gemini_fast_model); return result
 
     async def parse_text(self, text: str, document_type: str) -> dict:
         shape = ('{"rows":[{"date":"","customer_name":"","products":"","amount":0,"total_present":false,"given":0,"confidence":0}],"confidence":0}' if document_type == "udhaar" else '{"rows":[{"product_name":"","quantity":0,"total_price":0,"unit":"packet","mrp":0,"confidence":0}],"confidence":0}')

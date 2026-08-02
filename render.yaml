@@ -19,6 +19,12 @@ services:
         sync: false
       - key: KIRANA_GEMINI_MODEL
         value: gemini-3.5-flash
+      - key: KIRANA_GEMINI_FAST_MODEL
+        value: gemini-3.5-flash-lite
+      - key: KIRANA_DATABASE_POOL_SIZE
+        value: 10
+      - key: KIRANA_DATABASE_MAX_OVERFLOW
+        value: 10
       - key: KIRANA_ADMIN_USERNAME
         sync: false
       - key: KIRANA_ADMIN_PASSWORD

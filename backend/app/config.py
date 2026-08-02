@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     otp_dev_code: str = "123456"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.5-flash"
+    gemini_fast_model: str = "gemini-3.5-flash-lite"
+    database_pool_size: int = 10
+    database_max_overflow: int = 10
     admin_username: str = "id"
     admin_password: str = "root"
     upload_dir: str = "./uploads"

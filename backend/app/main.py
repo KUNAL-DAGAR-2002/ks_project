@@ -28,6 +28,10 @@ if "payment_mode" not in {column["name"] for column in inspect(engine).get_colum
 if "udhaar_entries" in inspect(engine).get_table_names() and "total_present" not in {column["name"] for column in inspect(engine).get_columns("udhaar_entries")}:
     with engine.begin() as connection:
         connection.execute(text("ALTER TABLE udhaar_entries ADD COLUMN total_present BOOLEAN NOT NULL DEFAULT 1"))
+if "cost_known" not in {column["name"] for column in inspect(engine).get_columns("sale_lines")}:
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE sale_lines ADD COLUMN cost_known BOOLEAN NOT NULL DEFAULT FALSE"))
+        connection.execute(text("UPDATE sale_lines SET cost_known = CASE WHEN unit_cost > 0 THEN TRUE ELSE FALSE END"))
 subscription_columns={column["name"] for column in inspect(engine).get_columns("subscriptions")}
 with engine.begin() as connection:
     if "monthly_price" not in subscription_columns:

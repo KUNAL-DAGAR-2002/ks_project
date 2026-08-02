@@ -20,7 +20,7 @@ def account(name="QA Owner"):
 def product(headers,bid,sid,name="QA Rice"):
     return client.post(f"/api/businesses/{bid}/products",headers=headers,json={"store_id":sid,"code":uuid.uuid4().hex[:8],"name":name,"base_unit":"kilogram","selling_unit":"kilogram","purchase_unit":"kilogram","selling_price":100,"purchase_cost":70,"reorder_level":2}).json()
 
-def test_duplicate_sale_and_negative_stock_are_blocked_without_extra_movement():
+def test_duplicate_sale_is_blocked_but_sales_can_exceed_recorded_stock():
     h,bid,sid,_=account(); p=product(h,bid,sid)
     client.post(f"/api/businesses/{bid}/inventory/movements",headers=h,json={"store_id":sid,"product_id":p["id"],"quantity":5,"unit_cost":70})
     body={"store_id":sid,"invoice_number":"SAME-SALE","payment_mode":"cash","lines":[{"product_id":p["id"],"quantity":2,"unit_price":100}]}
@@ -28,9 +28,9 @@ def test_duplicate_sale_and_negative_stock_are_blocked_without_extra_movement():
     duplicate=client.post(f"/api/businesses/{bid}/sales",headers=h,json=body)
     assert duplicate.status_code==409 and "already saved" in duplicate.json()["detail"]
     too_many={**body,"invoice_number":"TOO-MANY","lines":[{"product_id":p["id"],"quantity":4,"unit_price":100}]}
-    assert client.post(f"/api/businesses/{bid}/sales",headers=h,json=too_many).status_code==409
+    assert client.post(f"/api/businesses/{bid}/sales",headers=h,json=too_many).status_code==201
     inv=client.get(f"/api/businesses/{bid}/inventory",headers=h).json()[0]
-    assert inv["stock"]==3
+    assert inv["stock"]==-1
 
 def test_tenant_references_and_duplicate_supplier_bill_are_blocked():
     h1,b1,s1,_=account(); h2,b2,s2,_=account(); p1=product(h1,b1,s1)

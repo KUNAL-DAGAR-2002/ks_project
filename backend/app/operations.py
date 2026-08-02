@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 from .config import settings
 from .database import SessionLocal, get_db
 from .gemini_provider import GeminiProvider
@@ -43,6 +44,8 @@ class ProductEditIn(BaseModel): name:str=Field(min_length=2,max_length=180); sel
 class StockIn(BaseModel): store_id:str; product_id:str; quantity:float=Field(gt=0); movement_type:str="opening_stock"; unit_cost:float=Field(0,ge=0); notes:str|None=None
 class LineIn(BaseModel): product_id:str; quantity:float=Field(gt=0); unit_price:float=Field(ge=0)
 class SaleIn(BaseModel): store_id:str; invoice_number:str; payment_mode:str; transaction_date:date|None=None; customer_id:str|None=None; discount:float=Field(0,ge=0); lines:list[LineIn]=Field(min_length=1)
+class NamedSaleLineIn(BaseModel): name:str=Field(min_length=2,max_length=180); quantity:float=Field(gt=0); total_price:float=Field(gt=0); unit:str|None=None
+class NamedSaleIn(BaseModel): store_id:str; invoice_number:str; payment_mode:str; transaction_date:date|None=None; customer_id:str|None=None; discount:float=Field(0,ge=0); lines:list[NamedSaleLineIn]=Field(min_length=1,max_length=250)
 class PurchaseIn(BaseModel): store_id:str; supplier_id:str; invoice_number:str; transaction_date:date|None=None; payment_mode:str="cash"; paid:float=Field(0,ge=0); lines:list[LineIn]=Field(min_length=1)
 class PaymentIn(BaseModel): party_type:str; party_id:str; amount:float=Field(gt=0); entry_type:str="payment"
 class SupplierPaymentRecordIn(BaseModel): supplier_id:str; amount_paid:float=Field(gt=0); payment_date:date|None=None
@@ -67,6 +70,8 @@ class VendorEditIn(BaseModel): name:str=Field(min_length=2,max_length=180); mobi
 class InventoryEditIn(BaseModel): closing_stock:float=Field(ge=0); notes:str|None=None
 
 PAYMENT_MODES={"cash","upi","customer_credit"}
+def known_profit_expression():
+    return case((SaleLine.cost_known.is_(True),SaleLine.net-SaleLine.quantity*SaleLine.unit_cost),else_=0.0)
 def tenant_store(db:Session,business_id:str,store_id:str)->Store:
     row=db.scalar(select(Store).where(Store.id==store_id,Store.business_id==business_id))
     if not row:raise HTTPException(400,"This store was not found for your business.")
@@ -187,6 +192,42 @@ def product_unit_map(business_id:str,user:User=Depends(current_user),db:Session=
 def normalized_product_name(value:str)->str:
     return re.sub(r"[^a-z0-9\u0900-\u097f]+","",value.casefold())
 
+def fast_resolve_sales_product(db:Session,business_id:str,store_id:str,label:str,unit:str|None,products:list[Product])->tuple[Product,bool]:
+    """Resolve a sales product without an external AI call.
+
+    This path is deliberately deterministic and transaction-local so a daily
+    sale never waits on one AI request per row. AI extraction already provides
+    the cleaned label; close spelling variants are matched locally and truly
+    new products are created with an unknown purchase cost.
+    """
+    normalized=normalized_product_name(label)
+    for product in products:
+        if normalized in {normalized_product_name(product.name),normalized_product_name(product.local_name or "")}:
+            return product,False
+    aliases=db.execute(select(ProductAlias,Product).join(Product,Product.id==ProductAlias.product_id).where(ProductAlias.business_id==business_id,Product.active.is_(True))).all()
+    for alias,product in aliases:
+        if normalized_product_name(alias.alias)==normalized:return product,False
+    entered_numbers=re.findall(r"\d+(?:\.\d+)?",label)
+    scored=[]
+    for product in products:
+        candidate_numbers=re.findall(r"\d+(?:\.\d+)?",product.name)
+        if entered_numbers and candidate_numbers and entered_numbers!=candidate_numbers:continue
+        score=difflib.SequenceMatcher(None,normalized,normalized_product_name(product.name)).ratio()
+        scored.append((score,product))
+    if scored:
+        score,product=max(scored,key=lambda item:item[0])
+        if score>=0.88:
+            db.add(ProductAlias(business_id=business_id,product_id=product.id,alias=label.strip()))
+            return product,False
+    category_name=fallback_category(label)
+    category=db.scalar(select(Category).where(Category.business_id==business_id,func.lower(Category.name)==category_name.lower()))
+    if not category:
+        category=Category(business_id=business_id,name=category_name);db.add(category);db.flush()
+    resolved_unit=fallback_unit(label,unit)
+    product=Product(business_id=business_id,store_id=store_id,code=f"SALE-{uuid.uuid4().hex[:8].upper()}",name=label.strip(),category_id=category.id,base_unit=resolved_unit,purchase_unit=resolved_unit,selling_unit=resolved_unit,conversion_factor=1,mrp=0,selling_price=0,purchase_cost=0,reorder_level=0)
+    db.add(product);db.flush();products.append(product)
+    return product,True
+
 @router.post("/businesses/{business_id}/products/match")
 async def match_product(business_id:str,body:MatchProductIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id); entered=body.name.strip(); normalized=normalized_product_name(entered)
@@ -291,17 +332,40 @@ def post_sale(business_id:str,body:SaleIn,user:User=Depends(current_user),db:Ses
     if db.scalar(select(Sale.id).where(Sale.business_id==business_id,Sale.invoice_number==body.invoice_number)):raise HTTPException(409,"This sale was already saved. No duplicate entry was created.")
     products={p.id:p for p in db.scalars(select(Product).where(Product.business_id==business_id,Product.active.is_(True),Product.id.in_([x.product_id for x in body.lines])))}
     if len(products)!=len({x.product_id for x in body.lines}): raise HTTPException(400,"Invalid product")
-    requested={pid:sum(x.quantity for x in body.lines if x.product_id==pid) for pid in products}
-    for pid,quantity in requested.items():
-        stock_left=available_stock(db,business_id,pid)
-        if quantity>stock_left:raise HTTPException(409,f"Only {stock_left:g} {products[pid].base_unit} of {products[pid].name} is available. Reduce the quantity or add a purchase first.")
     if body.customer_id and not db.scalar(select(Customer.id).where(Customer.id==body.customer_id,Customer.business_id==business_id,Customer.active.is_(True))):raise HTTPException(400,"This customer was not found for your business.")
     gross=sum(x.quantity*x.unit_price for x in body.lines); sale=Sale(business_id=business_id,store_id=body.store_id,invoice_number=body.invoice_number,customer_id=body.customer_id,payment_mode=body.payment_mode,gross=gross,discount=body.discount,net=gross-body.discount,created_by=user.id,created_at=posted_at); db.add(sale); db.flush()
     for x in body.lines:
-        p=products[x.product_id]; db.add(SaleLine(business_id=business_id,sale_id=sale.id,product_id=p.id,quantity=x.quantity,unit_price=x.unit_price,unit_cost=p.purchase_cost,net=x.quantity*x.unit_price)); db.add(InventoryMovement(business_id=business_id,store_id=body.store_id,product_id=p.id,movement_type="sale",quantity_base=-x.quantity,unit_cost=p.purchase_cost,reference_type="sale",reference_id=sale.id,created_by=user.id,transaction_date=posted_at))
+        p=products[x.product_id]; cost_known=p.purchase_cost>0; db.add(SaleLine(business_id=business_id,sale_id=sale.id,product_id=p.id,quantity=x.quantity,unit_price=x.unit_price,unit_cost=p.purchase_cost,cost_known=cost_known,net=x.quantity*x.unit_price)); db.add(InventoryMovement(business_id=business_id,store_id=body.store_id,product_id=p.id,movement_type="sale",quantity_base=-x.quantity,unit_cost=p.purchase_cost,reference_type="sale",reference_id=sale.id,created_by=user.id,transaction_date=posted_at))
     if body.payment_mode=="customer_credit" and body.customer_id:
         db.add(LedgerEntry(business_id=business_id,party_type="customer",party_id=body.customer_id,entry_type="credit_sale",amount=sale.net,reference_id=sale.id,created_by=user.id,created_at=posted_at))
     audit(db,business_id,user,"post","sale",sale.id); db.commit(); return sale
+
+@router.post("/businesses/{business_id}/sales/by-name",status_code=201)
+def post_sale_by_name(business_id:str,body:NamedSaleIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    member(db,user,business_id)
+    # Lock the store row for the short resolution/write transaction. This
+    # prevents concurrent uploads for one store from creating duplicate names.
+    store=db.scalar(select(Store).where(Store.id==body.store_id,Store.business_id==business_id).with_for_update())
+    if not store:raise HTTPException(400,"This store was not found for your business.")
+    if body.payment_mode not in PAYMENT_MODES:raise HTTPException(422,"Choose Cash, UPI or Udhaar as the payment method.")
+    if db.scalar(select(Sale.id).where(Sale.business_id==business_id,Sale.invoice_number==body.invoice_number)):raise HTTPException(409,"This sale was already saved. No duplicate entry was created.")
+    if body.customer_id and not db.scalar(select(Customer.id).where(Customer.id==body.customer_id,Customer.business_id==business_id,Customer.active.is_(True))):raise HTTPException(400,"This customer was not found for your business.")
+    products=list(db.scalars(select(Product).where(Product.business_id==business_id,Product.active.is_(True))))
+    resolved=[];created_count=0
+    for line in body.lines:
+        product,created=fast_resolve_sales_product(db,business_id,body.store_id,line.name,line.unit,products)
+        resolved.append((product,line));created_count+=int(created)
+    posted_at=entry_datetime(body.transaction_date);gross=sum(line.total_price for _,line in resolved)
+    sale=Sale(business_id=business_id,store_id=body.store_id,invoice_number=body.invoice_number,customer_id=body.customer_id,payment_mode=body.payment_mode,gross=gross,discount=body.discount,net=max(0,gross-body.discount),created_by=user.id,created_at=posted_at)
+    db.add(sale);db.flush()
+    for product,line in resolved:
+        unit_price=line.total_price/line.quantity;cost_known=product.purchase_cost>0
+        db.add(SaleLine(business_id=business_id,sale_id=sale.id,product_id=product.id,quantity=line.quantity,unit_price=unit_price,unit_cost=product.purchase_cost,cost_known=cost_known,net=line.total_price))
+        db.add(InventoryMovement(business_id=business_id,store_id=body.store_id,product_id=product.id,movement_type="sale",quantity_base=-line.quantity,unit_cost=product.purchase_cost,reference_type="sale",reference_id=sale.id,created_by=user.id,transaction_date=posted_at,notes=None if cost_known else "Sale recorded before purchase cost was available"))
+    if body.payment_mode=="customer_credit" and body.customer_id:
+        db.add(LedgerEntry(business_id=business_id,party_type="customer",party_id=body.customer_id,entry_type="credit_sale",amount=sale.net,reference_id=sale.id,created_by=user.id,created_at=posted_at))
+    audit(db,business_id,user,"post_by_name","sale",sale.id);db.commit()
+    return {"id":sale.id,"net":sale.net,"created_products":created_count,"profit_excluded_lines":sum(not product.purchase_cost for product,_ in resolved)}
 
 @router.post("/businesses/{business_id}/purchases",status_code=201)
 def post_purchase(business_id:str,body:PurchaseIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
@@ -405,7 +469,7 @@ def sales_list(business_id:str,user:User=Depends(current_user),db:Session=Depend
 @router.get("/businesses/{business_id}/sales-details")
 def sales_details(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id); rows=db.execute(select(Sale,SaleLine,Product).join(SaleLine,SaleLine.sale_id==Sale.id).join(Product,Product.id==SaleLine.product_id).where(Sale.business_id==business_id).order_by(Sale.created_at.desc()).limit(300)).all()
-    return [{"sale_id":s.id,"line_id":line.id,"date":s.created_at,"invoice_number":s.invoice_number,"payment_mode":s.payment_mode,"customer_id":s.customer_id,"product_name":p.name,"quantity":line.quantity,"total_price":line.net,"unit_price":line.unit_price,"bought_price_per_unit":line.unit_cost,"profit_per_unit":line.unit_price-line.unit_cost,"profit_loss":line.net-line.quantity*line.unit_cost} for s,line,p in rows]
+    return [{"sale_id":s.id,"line_id":line.id,"date":s.created_at,"invoice_number":s.invoice_number,"payment_mode":s.payment_mode,"customer_id":s.customer_id,"product_name":p.name,"quantity":line.quantity,"total_price":line.net,"unit_price":line.unit_price,"cost_known":line.cost_known,"bought_price_per_unit":line.unit_cost if line.cost_known else None,"profit_per_unit":line.unit_price-line.unit_cost if line.cost_known else None,"profit_loss":line.net-line.quantity*line.unit_cost if line.cost_known else None} for s,line,p in rows]
 @router.patch("/businesses/{business_id}/sales/{sale_id}/lines/{line_id}")
 def edit_sale_line(business_id:str,sale_id:str,line_id:str,body:TransactionLineEditIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id,{"owner","manager"}); sale=db.scalar(select(Sale).where(Sale.id==sale_id,Sale.business_id==business_id)); line=db.scalar(select(SaleLine).where(SaleLine.id==line_id,SaleLine.sale_id==sale_id,SaleLine.business_id==business_id))
@@ -454,13 +518,13 @@ def delete_sale_line(business_id:str,sale_id:str,line_id:str,user:User=Depends(c
 @router.get("/businesses/{business_id}/sales-daily")
 def sales_daily(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id); sale_day=func.date(Sale.created_at)
-    rows=db.execute(select(sale_day.label("date"),func.count(func.distinct(Sale.id)).label("transactions"),func.coalesce(func.sum(SaleLine.quantity),0).label("quantity_sold"),func.coalesce(func.sum(SaleLine.net),0).label("total_sales"),func.coalesce(func.sum(SaleLine.net-SaleLine.quantity*SaleLine.unit_cost),0).label("profit"),func.coalesce(func.sum(case((func.lower(Sale.payment_mode)=="cash",SaleLine.net),else_=0)),0).label("cash_sales"),func.coalesce(func.sum(case((func.lower(Sale.payment_mode)=="upi",SaleLine.net),else_=0)),0).label("upi_sales"),func.coalesce(func.sum(case((func.lower(Sale.payment_mode)=="customer_credit",SaleLine.net),else_=0)),0).label("credit_sales")).outerjoin(SaleLine,SaleLine.sale_id==Sale.id).where(Sale.business_id==business_id).group_by(sale_day).order_by(sale_day.desc()).limit(90)).all()
+    rows=db.execute(select(sale_day.label("date"),func.count(func.distinct(Sale.id)).label("transactions"),func.coalesce(func.sum(SaleLine.quantity),0).label("quantity_sold"),func.coalesce(func.sum(SaleLine.net),0).label("total_sales"),func.coalesce(func.sum(known_profit_expression()),0).label("profit"),func.coalesce(func.sum(case((func.lower(Sale.payment_mode)=="cash",SaleLine.net),else_=0)),0).label("cash_sales"),func.coalesce(func.sum(case((func.lower(Sale.payment_mode)=="upi",SaleLine.net),else_=0)),0).label("upi_sales"),func.coalesce(func.sum(case((func.lower(Sale.payment_mode)=="customer_credit",SaleLine.net),else_=0)),0).label("credit_sales")).outerjoin(SaleLine,SaleLine.sale_id==Sale.id).where(Sale.business_id==business_id).group_by(sale_day).order_by(sale_day.desc()).limit(90)).all()
     return [{"date":r.date,"transactions":r.transactions,"quantity_sold":r.quantity_sold,"total_sales":r.total_sales,"profit":r.profit,"cash_sales":r.cash_sales,"upi_sales":r.upi_sales,"credit_sales":r.credit_sales} for r in rows]
 
 @router.get("/businesses/{business_id}/sales-products-daily")
 def sales_products_daily(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id); sale_day=func.date(Sale.created_at)
-    rows=db.execute(select(sale_day.label("date"),Product.id.label("product_id"),Product.name.label("product_name"),Product.base_unit.label("unit"),func.coalesce(func.sum(SaleLine.quantity),0).label("quantity_sold"),func.coalesce(func.sum(SaleLine.net),0).label("total_sales"),func.coalesce(func.sum(SaleLine.net-SaleLine.quantity*SaleLine.unit_cost),0).label("profit")).join(SaleLine,SaleLine.sale_id==Sale.id).join(Product,Product.id==SaleLine.product_id).where(Sale.business_id==business_id).group_by(sale_day,Product.id,Product.name,Product.base_unit).order_by(sale_day.desc(),func.sum(SaleLine.net).desc()).limit(1000)).all()
+    rows=db.execute(select(sale_day.label("date"),Product.id.label("product_id"),Product.name.label("product_name"),Product.base_unit.label("unit"),func.coalesce(func.sum(SaleLine.quantity),0).label("quantity_sold"),func.coalesce(func.sum(SaleLine.net),0).label("total_sales"),func.coalesce(func.sum(known_profit_expression()),0).label("profit")).join(SaleLine,SaleLine.sale_id==Sale.id).join(Product,Product.id==SaleLine.product_id).where(Sale.business_id==business_id).group_by(sale_day,Product.id,Product.name,Product.base_unit).order_by(sale_day.desc(),func.sum(SaleLine.net).desc()).limit(1000)).all()
     return [{"date":r.date,"product_id":r.product_id,"product_name":r.product_name,"unit":r.unit,"quantity_sold":r.quantity_sold,"total_sales":r.total_sales,"profit":r.profit} for r in rows]
 @router.get("/businesses/{business_id}/purchases")
 def purchase_list(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)): member(db,user,business_id); return db.scalars(select(Purchase).where(Purchase.business_id==business_id).order_by(Purchase.created_at.desc()).limit(100)).all()
@@ -537,7 +601,7 @@ def expense(business_id:str,body:ExpenseIn,user:User=Depends(current_user),db:Se
 
 @router.get("/businesses/{business_id}/dashboard")
 def dashboard(business_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    membership=member(db,user,business_id); today=now().date(); previous_day=today-timedelta(days=1); sales=db.scalar(select(func.coalesce(func.sum(Sale.net),0)).where(Sale.business_id==business_id)); today_sales=db.scalar(select(func.coalesce(func.sum(Sale.net),0)).where(Sale.business_id==business_id,func.date(Sale.created_at)==today)); today_cash=db.scalar(select(func.coalesce(func.sum(Sale.net),0)).where(Sale.business_id==business_id,func.date(Sale.created_at)==today,Sale.payment_mode=="cash")); today_transactions=db.scalar(select(func.count(Sale.id)).where(Sale.business_id==business_id,func.date(Sale.created_at)==today)); today_quantity=db.scalar(select(func.coalesce(func.sum(SaleLine.quantity),0)).join(Sale,Sale.id==SaleLine.sale_id).where(Sale.business_id==business_id,func.date(Sale.created_at)==today)); purchases=db.scalar(select(func.coalesce(func.sum(Purchase.total),0)).where(Purchase.business_id==business_id)); expenses=db.scalar(select(func.coalesce(func.sum(Expense.amount),0)).where(Expense.business_id==business_id)); profit_expression=SaleLine.net-SaleLine.quantity*SaleLine.unit_cost; gp=db.scalar(select(func.coalesce(func.sum(profit_expression),0)).where(SaleLine.business_id==business_id)); today_profit=db.scalar(select(func.coalesce(func.sum(profit_expression),0)).join(Sale,Sale.id==SaleLine.sale_id).where(SaleLine.business_id==business_id,func.date(Sale.created_at)==today)); previous_day_profit=db.scalar(select(func.coalesce(func.sum(profit_expression),0)).join(Sale,Sale.id==SaleLine.sale_id).where(SaleLine.business_id==business_id,func.date(Sale.created_at)==previous_day)); inv=inventory(business_id,user,db); customer_balances=ledger(business_id,"customer",user,db);customer_due=sum(max(0,float(x["balance"])) for x in customer_balances);supplier_credit=db.scalar(select(func.coalesce(func.sum(Purchase.total),0)).where(Purchase.business_id==business_id,Purchase.payment_mode=="supplier_credit"));supplier_paid=db.scalar(select(func.coalesce(func.sum(LedgerEntry.amount),0)).where(LedgerEntry.business_id==business_id,LedgerEntry.party_type=="supplier",LedgerEntry.entry_type=="payment"));supplier_due=max(0,supplier_credit+supplier_paid);result={"today_sales":today_sales,"today_cash":today_cash,"today_transactions":today_transactions,"today_quantity_sold":today_quantity,"net_sales":sales,"customer_outstanding":customer_due,"supplier_outstanding":supplier_due,"customer_due_count":sum(float(x["balance"])>0 for x in customer_balances),"low_stock_count":sum(x["status"]=="low" for x in inv),"out_of_stock_count":sum(x["status"]=="out_of_stock" for x in inv)}
+    membership=member(db,user,business_id); today=now().date(); previous_day=today-timedelta(days=1); sales=db.scalar(select(func.coalesce(func.sum(Sale.net),0)).where(Sale.business_id==business_id)); today_sales=db.scalar(select(func.coalesce(func.sum(Sale.net),0)).where(Sale.business_id==business_id,func.date(Sale.created_at)==today)); today_cash=db.scalar(select(func.coalesce(func.sum(Sale.net),0)).where(Sale.business_id==business_id,func.date(Sale.created_at)==today,Sale.payment_mode=="cash")); today_transactions=db.scalar(select(func.count(Sale.id)).where(Sale.business_id==business_id,func.date(Sale.created_at)==today)); today_quantity=db.scalar(select(func.coalesce(func.sum(SaleLine.quantity),0)).join(Sale,Sale.id==SaleLine.sale_id).where(Sale.business_id==business_id,func.date(Sale.created_at)==today)); purchases=db.scalar(select(func.coalesce(func.sum(Purchase.total),0)).where(Purchase.business_id==business_id)); expenses=db.scalar(select(func.coalesce(func.sum(Expense.amount),0)).where(Expense.business_id==business_id)); profit_expression=known_profit_expression(); gp=db.scalar(select(func.coalesce(func.sum(profit_expression),0)).where(SaleLine.business_id==business_id)); today_profit=db.scalar(select(func.coalesce(func.sum(profit_expression),0)).join(Sale,Sale.id==SaleLine.sale_id).where(SaleLine.business_id==business_id,func.date(Sale.created_at)==today)); previous_day_profit=db.scalar(select(func.coalesce(func.sum(profit_expression),0)).join(Sale,Sale.id==SaleLine.sale_id).where(SaleLine.business_id==business_id,func.date(Sale.created_at)==previous_day)); inv=inventory(business_id,user,db); customer_balances=ledger(business_id,"customer",user,db);customer_due=sum(max(0,float(x["balance"])) for x in customer_balances);supplier_credit=db.scalar(select(func.coalesce(func.sum(Purchase.total),0)).where(Purchase.business_id==business_id,Purchase.payment_mode=="supplier_credit"));supplier_paid=db.scalar(select(func.coalesce(func.sum(LedgerEntry.amount),0)).where(LedgerEntry.business_id==business_id,LedgerEntry.party_type=="supplier",LedgerEntry.entry_type=="payment"));supplier_due=max(0,supplier_credit+supplier_paid);result={"today_sales":today_sales,"today_cash":today_cash,"today_transactions":today_transactions,"today_quantity_sold":today_quantity,"net_sales":sales,"customer_outstanding":customer_due,"supplier_outstanding":supplier_due,"customer_due_count":sum(float(x["balance"])>0 for x in customer_balances),"low_stock_count":sum(x["status"]=="low" for x in inv),"out_of_stock_count":sum(x["status"]=="out_of_stock" for x in inv)}
     if membership.role.value in {"owner","manager"}:result.update({"total_purchases":purchases,"estimated_gross_profit":gp,"expenses":expenses,"estimated_operating_profit":gp-expenses,"today_profit":today_profit,"previous_day_profit":previous_day_profit,"inventory_value":sum(x["value"] for x in inv)})
     return result
 @router.get("/businesses/{business_id}/reorder-list")
@@ -552,11 +616,12 @@ def _analysis_period(db:Session,business_id:str,label:str,start:date,end:date)->
     purchases=float(db.scalar(select(func.coalesce(func.sum(Purchase.total),0)).where(*purchase_filter)) or 0)
     expenses=float(db.scalar(select(func.coalesce(func.sum(Expense.amount),0)).where(*expense_filter)) or 0)
     quantity=float(db.scalar(select(func.coalesce(func.sum(SaleLine.quantity),0)).join(Sale,Sale.id==SaleLine.sale_id).where(*sale_filter)) or 0)
-    profit=float(db.scalar(select(func.coalesce(func.sum(SaleLine.net-SaleLine.quantity*SaleLine.unit_cost),0)).join(Sale,Sale.id==SaleLine.sale_id).where(*sale_filter)) or 0)
+    profit=float(db.scalar(select(func.coalesce(func.sum(known_profit_expression()),0)).join(Sale,Sale.id==SaleLine.sale_id).where(*sale_filter)) or 0)
+    profit_eligible_sales=float(db.scalar(select(func.coalesce(func.sum(case((SaleLine.cost_known.is_(True),SaleLine.net),else_=0.0)),0)).join(Sale,Sale.id==SaleLine.sale_id).where(*sale_filter)) or 0)
     transactions=int(db.scalar(select(func.count(Sale.id)).where(*sale_filter)) or 0)
     payment_rows=db.execute(select(Sale.payment_mode,func.coalesce(func.sum(Sale.net),0)).where(*sale_filter).group_by(Sale.payment_mode)).all()
     days=max(1,(end-start).days+1)
-    return {"label":label,"from":start.isoformat(),"to":end.isoformat(),"recorded_days":days,"sales":round(sales,2),"quantity_sold":round(quantity,2),"sales_transactions":transactions,"purchases":round(purchases,2),"expenses":round(expenses,2),"gross_profit":round(profit,2),"gross_margin_percent":round(profit/sales*100,1) if sales else 0,"average_daily_sales":round(sales/days,2),"payment_mix":{str(mode):round(float(amount),2) for mode,amount in payment_rows}}
+    return {"label":label,"from":start.isoformat(),"to":end.isoformat(),"recorded_days":days,"sales":round(sales,2),"quantity_sold":round(quantity,2),"sales_transactions":transactions,"purchases":round(purchases,2),"expenses":round(expenses,2),"gross_profit":round(profit,2),"profit_eligible_sales":round(profit_eligible_sales,2),"profit_excluded_sales":round(sales-profit_eligible_sales,2),"gross_margin_percent":round(profit/profit_eligible_sales*100,1) if profit_eligible_sales else 0,"average_daily_sales":round(sales/days,2),"payment_mix":{str(mode):round(float(amount),2) for mode,amount in payment_rows}}
 
 def _business_analysis_context(db:Session,business_id:str,user:User)->dict:
     today=now().date(); week_start=today-timedelta(days=6); month_start=today.replace(day=1)
@@ -570,7 +635,7 @@ def _business_analysis_context(db:Session,business_id:str,user:User)->dict:
         _analysis_period(db,business_id,"previous_weekly",week_start-timedelta(days=7),week_start-timedelta(days=1)),
     ]
     top_rows=db.execute(
-        select(Product.name,func.sum(SaleLine.quantity),func.sum(SaleLine.net),func.sum(SaleLine.net-SaleLine.quantity*SaleLine.unit_cost))
+        select(Product.name,func.sum(SaleLine.quantity),func.sum(SaleLine.net),func.sum(known_profit_expression()))
         .join(SaleLine,SaleLine.product_id==Product.id).join(Sale,Sale.id==SaleLine.sale_id)
         .where(Product.business_id==business_id,Sale.business_id==business_id,func.date(Sale.created_at)>=month_start,func.date(Sale.created_at)<=today)
         .group_by(Product.id,Product.name).order_by(func.sum(SaleLine.net).desc()).limit(10)
@@ -616,27 +681,27 @@ def _report_analytics(db:Session,business_id:str,user:User,period:str)->dict:
     start,end=_report_window(period); start_day,end_day=start.isoformat(),end.isoformat()
     rows=db.execute(
         select(Sale.created_at,Product.id,Product.name,Product.base_unit,Category.name,Sale.payment_mode,
-               SaleLine.quantity,SaleLine.net,(SaleLine.net-SaleLine.quantity*SaleLine.unit_cost).label("profit"))
+               SaleLine.quantity,SaleLine.net,SaleLine.cost_known,known_profit_expression().label("profit"))
         .join(SaleLine,SaleLine.sale_id==Sale.id).join(Product,Product.id==SaleLine.product_id)
         .outerjoin(Category,Category.id==Product.category_id)
         .where(Sale.business_id==business_id,func.date(Sale.created_at)>=start,func.date(Sale.created_at)<=end)
     ).all()
     daily:dict[str,dict]={}; products:dict[str,dict]={}; categories:dict[str,dict]={}
-    for created,pid,pname,unit,category,payment_mode,qty,net,profit in rows:
-        day=created.date().isoformat(); d=daily.setdefault(day,{"date":day,"sales":0.0,"profit":0.0,"udhaar":0.0,"quantity":0.0})
-        d["sales"]+=float(net);d["profit"]+=float(profit);d["quantity"]+=float(qty)
+    for created,pid,pname,unit,category,payment_mode,qty,net,cost_known,profit in rows:
+        day=created.date().isoformat(); d=daily.setdefault(day,{"date":day,"sales":0.0,"profit":0.0,"profit_eligible_sales":0.0,"udhaar":0.0,"quantity":0.0})
+        d["sales"]+=float(net);d["profit"]+=float(profit);d["profit_eligible_sales"]+=float(net) if cost_known else 0.0;d["quantity"]+=float(qty)
         if str(payment_mode).lower()=="customer_credit":d["udhaar"]+=float(net)
-        p=products.setdefault(pid,{"product_id":pid,"name":pname,"unit":unit,"quantity":0.0,"sales":0.0,"profit":0.0})
-        p["quantity"]+=float(qty);p["sales"]+=float(net);p["profit"]+=float(profit)
-        cname=category or "Uncategorised";c=categories.setdefault(cname,{"name":cname,"quantity":0.0,"sales":0.0,"profit":0.0})
-        c["quantity"]+=float(qty);c["sales"]+=float(net);c["profit"]+=float(profit)
+        p=products.setdefault(pid,{"product_id":pid,"name":pname,"unit":unit,"quantity":0.0,"sales":0.0,"profit":0.0,"profit_eligible_sales":0.0})
+        p["quantity"]+=float(qty);p["sales"]+=float(net);p["profit"]+=float(profit);p["profit_eligible_sales"]+=float(net) if cost_known else 0.0
+        cname=category or "Uncategorised";c=categories.setdefault(cname,{"name":cname,"quantity":0.0,"sales":0.0,"profit":0.0,"profit_eligible_sales":0.0})
+        c["quantity"]+=float(qty);c["sales"]+=float(net);c["profit"]+=float(profit);c["profit_eligible_sales"]+=float(net) if cost_known else 0.0
     cursor=start
     while cursor<=end:
-        key=cursor.isoformat();daily.setdefault(key,{"date":key,"sales":0.0,"profit":0.0,"udhaar":0.0,"quantity":0.0});cursor+=timedelta(days=1)
+        key=cursor.isoformat();daily.setdefault(key,{"date":key,"sales":0.0,"profit":0.0,"profit_eligible_sales":0.0,"udhaar":0.0,"quantity":0.0});cursor+=timedelta(days=1)
     daily_rows=sorted(daily.values(),key=lambda x:x["date"])
     product_rows=sorted(products.values(),key=lambda x:(-x["quantity"],-x["sales"]))
     category_rows=sorted(categories.values(),key=lambda x:(-x["quantity"],-x["sales"]))
-    total_sales=sum(x["sales"] for x in daily_rows);total_profit=sum(x["profit"] for x in daily_rows);total_qty=sum(x["quantity"] for x in daily_rows)
+    total_sales=sum(x["sales"] for x in daily_rows);total_profit=sum(x["profit"] for x in daily_rows);profit_eligible_sales=sum(x["profit_eligible_sales"] for x in daily_rows);total_qty=sum(x["quantity"] for x in daily_rows)
     cumulative=0.0;pareto=[]
     for product in sorted(product_rows,key=lambda x:-x["sales"]):
         cumulative+=product["sales"];share=(product["sales"]/total_sales*100) if total_sales else 0
@@ -653,7 +718,7 @@ def _report_analytics(db:Session,business_id:str,user:User,period:str)->dict:
         d=date.fromisoformat(row["date"]);monday=d-timedelta(days=d.weekday());wk=weekly.setdefault(monday.isoformat(),{"week_start":monday.isoformat(),"sales":0.0,"profit":0.0,"udhaar":0.0,"quantity":0.0});month=monthly.setdefault(d.strftime("%Y-%m"),{"month":d.strftime("%Y-%m"),"sales":0.0,"profit":0.0,"udhaar":0.0,"quantity":0.0})
         for target in (wk,month):
             target["sales"]+=row["sales"];target["profit"]+=row["profit"];target["udhaar"]+=row["udhaar"];target["quantity"]+=row["quantity"]
-    kpis={"total_sales":round(total_sales,2),"profit":round(total_profit,2),"quantity_sold":round(total_qty,2),"gross_margin_percent":round(total_profit/total_sales*100,1) if total_sales else 0,
+    kpis={"total_sales":round(total_sales,2),"profit":round(total_profit,2),"profit_eligible_sales":round(profit_eligible_sales,2),"profit_excluded_sales":round(total_sales-profit_eligible_sales,2),"quantity_sold":round(total_qty,2),"gross_margin_percent":round(total_profit/profit_eligible_sales*100,1) if profit_eligible_sales else 0,
           "most_sold_product":product_rows[0] if product_rows else None,"least_sold_product":product_rows[-1] if product_rows else None,
           "most_sold_category":category_rows[0] if category_rows else None,"least_sold_category":category_rows[-1] if category_rows else None}
     immediate=[]
@@ -718,15 +783,22 @@ async def upload_image(business_id:str,store_id:str,document_type:str,file:Uploa
     if len(content)>10*1024*1024: raise HTTPException(413,"File exceeds 10 MB")
     signatures={"image/jpeg":content.startswith(b"\xff\xd8\xff"),"image/png":content.startswith(b"\x89PNG\r\n\x1a\n"),"image/webp":content.startswith(b"RIFF") and content[8:12]==b"WEBP"}
     if not signatures[file.content_type]:raise HTTPException(415,"This file does not appear to be a valid image. Take a new photo and try again.")
-    folder=Path(settings.upload_dir)/business_id; folder.mkdir(parents=True,exist_ok=True); path=folder/f"{uuid.uuid4()}{Path(file.filename or 'upload').suffix.lower()}"; path.write_bytes(content)
+    folder=Path(settings.upload_dir)/business_id; await run_in_threadpool(folder.mkdir,parents=True,exist_ok=True); path=folder/f"{uuid.uuid4()}{Path(file.filename or 'upload').suffix.lower()}"; await run_in_threadpool(path.write_bytes,content)
     row=ImageDocument(business_id=business_id,store_id=store_id,uploaded_by=user.id,document_type=document_type,filename=file.filename or "upload",storage_path=str(path),mime_type=file.content_type,status="uploaded"); db.add(row); db.commit(); db.refresh(row); return {"id":row.id,"status":row.status}
 @router.post("/businesses/{business_id}/images/{document_id}/extract")
 async def extract_image(business_id:str,document_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
     member(db,user,business_id); row=db.scalar(select(ImageDocument).where(ImageDocument.id==document_id,ImageDocument.business_id==business_id));
     if not row: raise HTTPException(404,"Document not found")
-    try: data=await tracked_provider(business_id,user.id,f"image_{row.document_type}").extract(row.storage_path,row.mime_type,row.document_type)
-    except RuntimeError as exc: row.status="failed"; db.commit(); raise HTTPException(502,f"AI extraction failed: {exc}") from exc
-    except Exception as exc: row.status="failed"; db.commit(); raise HTTPException(502,"AI extraction failed because Gemini could not be reached. Check your internet connection and try again.") from exc
+    if row.status=="review_required":return {"id":row.id,"status":row.status,"data":row.structured_data}
+    if row.status=="processing":raise HTTPException(409,"This image is already being processed.")
+    storage_path,mime_type,document_type=row.storage_path,row.mime_type,row.document_type
+    row.status="processing";db.commit()  # release the DB connection during the external AI request
+    try: data=await tracked_provider(business_id,user.id,f"image_{document_type}").extract(storage_path,mime_type,document_type)
+    except RuntimeError as exc:
+        row=db.scalar(select(ImageDocument).where(ImageDocument.id==document_id,ImageDocument.business_id==business_id));row.status="failed"; db.commit(); raise HTTPException(502,f"AI extraction failed: {exc}") from exc
+    except Exception as exc:
+        row=db.scalar(select(ImageDocument).where(ImageDocument.id==document_id,ImageDocument.business_id==business_id));row.status="failed"; db.commit(); raise HTTPException(502,"AI extraction failed because Gemini could not be reached. Check your internet connection and try again.") from exc
+    row=db.scalar(select(ImageDocument).where(ImageDocument.id==document_id,ImageDocument.business_id==business_id))
     row.structured_data=data; row.confidence=float(data.get("confidence",0)); row.status="review_required"; db.commit(); return {"id":row.id,"status":row.status,"data":data}
 @router.post("/businesses/{business_id}/images/{document_id}/confirm")
 def confirm_image(business_id:str,document_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
@@ -735,17 +807,17 @@ def confirm_image(business_id:str,document_id:str,user:User=Depends(current_user
     created_id=None
     if row.document_type=="sales":
         extracted=(row.structured_data or {}).get("rows",[]); lines=[]
+        products=list(db.scalars(select(Product).where(Product.business_id==business_id,Product.active.is_(True))))
         for item in extracted:
-            product=db.scalar(select(Product).where(Product.business_id==business_id,func.lower(Product.name)==str(item.get("product_name","")).lower()))
-            if not product:
-                alias=db.scalar(select(ProductAlias).where(ProductAlias.business_id==business_id,func.lower(ProductAlias.alias)==str(item.get("product_name","")).lower())); product=db.get(Product,alias.product_id) if alias else None
-            if not product: raise HTTPException(409,f"Review required: product not matched: {item.get('product_name','unknown')}")
+            label=str(item.get("product_name","")).strip()
+            if not label:raise HTTPException(409,"Review required: every row needs a product name")
+            product,_=fast_resolve_sales_product(db,business_id,row.store_id,label,str(item.get("unit") or "") or None,products)
             qty=float(item.get("quantity",0)); price=float(item.get("total_price",0))/qty if qty and item.get("total_price") is not None else float(item.get("unit_price",0) or product.selling_price)
             if qty<=0: raise HTTPException(409,"Review required: all quantities must be positive")
             lines.append((product,qty,price))
         if not lines: raise HTTPException(409,"No confirmed sale rows")
         gross=sum(q*p for _,q,p in lines); sale=Sale(business_id=business_id,store_id=row.store_id,invoice_number=f"IMG-{row.id[:8]}",payment_mode="cash",gross=gross,discount=0,net=gross,created_by=user.id); db.add(sale); db.flush(); created_id=sale.id
-        for product,qty,price in lines: db.add(SaleLine(business_id=business_id,sale_id=sale.id,product_id=product.id,quantity=qty,unit_price=price,unit_cost=product.purchase_cost,net=qty*price)); db.add(InventoryMovement(business_id=business_id,store_id=row.store_id,product_id=product.id,movement_type="sale",quantity_base=-qty,unit_cost=product.purchase_cost,reference_type="image_sale",reference_id=sale.id,created_by=user.id))
+        for product,qty,price in lines: db.add(SaleLine(business_id=business_id,sale_id=sale.id,product_id=product.id,quantity=qty,unit_price=price,unit_cost=product.purchase_cost,cost_known=product.purchase_cost>0,net=qty*price)); db.add(InventoryMovement(business_id=business_id,store_id=row.store_id,product_id=product.id,movement_type="sale",quantity_base=-qty,unit_cost=product.purchase_cost,reference_type="image_sale",reference_id=sale.id,created_by=user.id))
     row.status="confirmed"; row.confirmed_by=user.id; audit(db,business_id,user,"confirm_and_post","image_document",row.id); db.commit(); return {"id":row.id,"status":"confirmed","created_transaction_id":created_id}
 
 @router.post("/businesses/{business_id}/imports/products")
@@ -772,7 +844,7 @@ def daily_closing_pdf(business_id:str,report_date:date|None=None,user:User=Depen
     from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
     member(db,user,business_id,{"owner","manager"}); report_day=report_date or now().date(); day=report_day.isoformat()
     sale_total=float(db.scalar(select(func.coalesce(func.sum(SaleLine.net),0)).join(Sale,Sale.id==SaleLine.sale_id).where(Sale.business_id==business_id,func.date(Sale.created_at)==report_day)) or 0)
-    profit=float(db.scalar(select(func.coalesce(func.sum(SaleLine.net-SaleLine.quantity*SaleLine.unit_cost),0)).join(Sale,Sale.id==SaleLine.sale_id).where(Sale.business_id==business_id,func.date(Sale.created_at)==report_day)) or 0)
+    profit=float(db.scalar(select(func.coalesce(func.sum(known_profit_expression()),0)).join(Sale,Sale.id==SaleLine.sale_id).where(Sale.business_id==business_id,func.date(Sale.created_at)==report_day)) or 0)
     def sale_mode(mode:str):return float(db.scalar(select(func.coalesce(func.sum(SaleLine.net),0)).join(Sale,Sale.id==SaleLine.sale_id).where(Sale.business_id==business_id,func.date(Sale.created_at)==report_day,Sale.payment_mode==mode)) or 0)
     cash_sales,upi_sales,credit_sales=sale_mode("cash"),sale_mode("upi"),sale_mode("customer_credit")
     purchases=float(db.scalar(select(func.coalesce(func.sum(Purchase.total),0)).where(Purchase.business_id==business_id,func.date(Purchase.created_at)==report_day)) or 0)

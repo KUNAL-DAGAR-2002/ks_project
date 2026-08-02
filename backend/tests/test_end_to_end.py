@@ -65,3 +65,26 @@ def test_complete_manual_business_flow():
     assert client.delete(f"/api/businesses/{bid}/inventory/{milk_id}",headers=h).status_code==200
     assert milk_id not in {x["product_id"] for x in client.get(f"/api/businesses/{bid}/inventory",headers=h).json()}
     bad=client.post(f"/api/businesses/{bid}/imports/products?store_id={sid}",headers=h,files={"file":("bad.csv",b"wrong,data\n1,2","text/csv")}); assert bad.status_code==422
+
+
+def test_daily_sale_creates_missing_product_and_excludes_unknown_cost_from_profit():
+    h={"Authorization":f"Bearer {token()}"}
+    business=client.post("/api/onboarding",headers=h,json={"business_name":"Fast Sales Kirana","store_name":"Main","city":"Delhi","state":"Delhi","pin_code":"110001","preferred_language":"en"}).json()
+    bid=business["id"]
+    from app.database import SessionLocal
+    from app.models import Store
+    from sqlalchemy import select
+    with SessionLocal() as db:sid=db.scalar(select(Store.id).where(Store.business_id==bid))
+    product_name=f"Direct Sale Item {uuid.uuid4().hex[:8]}"
+    first=client.post(f"/api/businesses/{bid}/sales/by-name",headers=h,json={"store_id":sid,"invoice_number":"DIRECT-1","payment_mode":"cash","lines":[{"name":product_name,"quantity":2,"total_price":100,"unit":"packet"}]})
+    assert first.status_code==201 and first.json()["created_products"]==1 and first.json()["profit_excluded_lines"]==1
+    products=client.get(f"/api/businesses/{bid}/products",headers=h).json();product=next(row for row in products if row["name"]==product_name)
+    detail=next(row for row in client.get(f"/api/businesses/{bid}/sales-details",headers=h).json() if row["product_name"]==product_name)
+    assert detail["cost_known"] is False and detail["profit_loss"] is None
+    supplier=client.post(f"/api/businesses/{bid}/suppliers",headers=h,json={"name":"Fast Supplier"}).json()
+    purchase=client.post(f"/api/businesses/{bid}/purchases",headers=h,json={"store_id":sid,"supplier_id":supplier["id"],"invoice_number":"COST-1","payment_mode":"cash","lines":[{"product_id":product["id"],"quantity":5,"unit_price":30}]})
+    assert purchase.status_code==201
+    second=client.post(f"/api/businesses/{bid}/sales/by-name",headers=h,json={"store_id":sid,"invoice_number":"DIRECT-2","payment_mode":"upi","lines":[{"name":product_name,"quantity":2,"total_price":80,"unit":"packet"}]})
+    assert second.status_code==201 and second.json()["created_products"]==0 and second.json()["profit_excluded_lines"]==0
+    daily=client.get(f"/api/businesses/{bid}/sales-daily",headers=h).json()[0]
+    assert daily["total_sales"]==180 and daily["profit"]==20
