@@ -340,7 +340,7 @@ function HomeCreditTables(){
 function SmartEntry(){
   const entryType="sales" as const; const [rows,setRows]=useState<Row[]>([]),[entryDate,setEntryDate]=useState(todayInput()),[paymentMode,setPaymentMode]=useState("cash"),[ctx,setCtx]=useState<Row>({}),[status,setStatus]=useState(""),[busy,setBusy]=useState(false);
   const token=typeof window!=="undefined"?sessionStorage.getItem("kirana_token")||"":""; const headers={Authorization:`Bearer ${token}`};
-  async function req(path:string,opt:RequestInit={}){const r=await fetch(`${API}${path}`,opt);const d=await r.json();if(!r.ok)throw new Error(typeof d.detail==="string"?d.detail:"Could not process entry");return d}
+  async function req(path:string,opt:RequestInit={}){const r=await fetch(`${API}${path}`,opt);const contentType=r.headers.get("content-type")||"";const d=contentType.includes("json")?await r.json():{detail:(await r.text()).trim()};if(!r.ok)throw new Error(typeof d.detail==="string"&&d.detail?d.detail:`Could not process entry (${r.status})`);return d}
   useEffect(()=>{if(!token)return;(async()=>{const businesses=await req("/businesses",{headers});if(!businesses.length)return;const b=businesses[0],stores=await req(`/businesses/${b.id}/stores`,{headers}),products=await req(`/businesses/${b.id}/products`,{headers}),customers=await req(`/businesses/${b.id}/customers`,{headers});setCtx({business:b,store:stores[0],products,customers})})().catch(e=>setStatus(e.message))},[token]);
   useEffect(()=>{if(!ctx.business)return;const saved=localStorage.getItem(`kirana-sales-draft-${ctx.business.id}`);if(saved)try{const draft=JSON.parse(saved);if(draft.rows?.length){setRows(draft.rows);setStatus("Aapki adhuri bikri wapas mil gayi. Check karke save karein.")}}catch{}},[ctx.business?.id]);
   useEffect(()=>{if(ctx.business&&rows.length)localStorage.setItem(`kirana-sales-draft-${ctx.business.id}`,JSON.stringify({rows}))},[rows,ctx.business?.id]);
@@ -433,7 +433,7 @@ function BusinessAssistant({businessId,language}:{businessId:string,language:Lan
   </section></div>}</>
 }
 
-function SessionApi(){const token=typeof window!=="undefined"?sessionStorage.getItem("kirana_token")||"":"";const headers={Authorization:`Bearer ${token}`};async function req(path:string,opt:RequestInit={}){const r=await fetch(`${API}${path}`,opt);const d=await r.json();if(!r.ok)throw new Error(typeof d.detail==="string"?d.detail:"Request failed");return d}return {headers,req,token}}
+function SessionApi(){const token=typeof window!=="undefined"?sessionStorage.getItem("kirana_token")||"":"";const headers={Authorization:`Bearer ${token}`};async function req(path:string,opt:RequestInit={}){const r=await fetch(`${API}${path}`,opt);const contentType=r.headers.get("content-type")||"";const d=contentType.includes("json")?await r.json():{detail:(await r.text()).trim()};if(!r.ok)throw new Error(typeof d.detail==="string"&&d.detail?d.detail:`Request failed (${r.status})`);return d}return {headers,req,token}}
 
 function LegacyProductManager(){
   const {headers,req,token}=SessionApi(),[ctx,setCtx]=useState<Row>({}),[editing,setEditing]=useState<Row|null>(null),[status,setStatus]=useState(""),[busy,setBusy]=useState(false);
